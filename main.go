@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/sha256"
+	// "encoding/base32"
 	"encoding/csv"
 	"flag"
 	"fmt"
@@ -17,11 +18,32 @@ import (
 	"time"
 
 	cid "github.com/ipfs/go-cid"
+	multibase "github.com/multiformats/go-multibase"
 )
 
 // date: 09.06.2024
 // added github.com/ipfs/go-cid package
 // go install github.com/ipfs/go-cid@latest
+
+
+var (
+	ipfsGateways = []string{
+		"https://ipfs.io/ipfs/",
+		"https://cloudflare-ipfs.com/ipfs/",
+		"https://gateway.pinata.cloud/ipfs/",
+		"https://dweb.link/ipfs/",
+		"https://ipfs.eth.aragon.network/ipfs/",
+		"https://trustless-gateway.link/ipfs/",
+		"https://ipfs.runfission.com/ipfs/",
+		"https://4everland.io/ipfs/",
+		"https://w3s.link/ipfs/",
+		"https://nftstorage.link/ipfs/",
+		"https://hardbin.com/ipfs/",
+		"https://storry.tv/ipfs/",
+		"https://cf-ipfs.com/ipfs/",
+	}
+	gatewayLock sync.Mutex
+)
 
 var httpClient = &http.Client{
 	Timeout: 10 * time.Second,
@@ -47,7 +69,7 @@ func downloadFile(url string, filePathStr string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Bad Status: %s", resp.Status)
+		return fmt.Errorf("bad Status: %s", resp.Status)
 	}
 
 	_, err = io.Copy(out, resp.Body)
@@ -182,7 +204,7 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 				resultsLock.Unlock()
 
 				statuses := make([]string, len(gateways))
-				// anyAvailable := false
+				anyAvailable := false
 				for i, gateway := range gateways {
 					url := gateway + cidStr
 					status, err := sendReq(url)
@@ -195,7 +217,7 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 					if status == http.StatusOK {
 						log.Printf("[++] Content is available at %s", url)
 						statuses[i] = "+"
-						// anyAvailable = true
+						anyAvailable = true
 
 						resultsLock.Lock()
 						if _, err := fileActiveTxt.WriteString(url + "\n"); err != nil {
@@ -208,6 +230,14 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 					}
 				}
 
+				//Checking for additional/new gateways in the found ipfs links and adding them to the ipfsGateways list
+				if strings.HasPrefix(link, "http://") || strings.HasPrefix(link, "https://") {
+					parts := strings.Split(link, "/ipfs/")
+					if len(parts) > 1 {
+						baseURL := parts[0] + "/ipfs/"
+						addNewGateway(baseURL)
+					}
+				}
 
 				//Converting CID to hash & checking with Bad Bits Denylist
 				hashedCID, err := convertCIDToHash(cidStr)
@@ -220,16 +250,18 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 					blocked = "yes"
 				}
 
-				resultRow := append([]string{cidStr, blocked}, statuses...)
-
-				func() {
-					resultsLock.Lock()
-					defer resultsLock.Unlock()
-					if err := csvWriter.Write(resultRow); err != nil {
-						log.Printf("Failed to write row to the CSV file: %s", err)
-					}
-					csvWriter.Flush()
-				}()
+				
+				if anyAvailable {
+					resultRow := append([]string{cidStr, blocked}, statuses...)
+					func() {
+						resultsLock.Lock()
+						defer resultsLock.Unlock()
+						if err := csvWriter.Write(resultRow); err != nil {
+							log.Printf("Failed to write row to the CSV file: %s", err)
+						}
+						csvWriter.Flush()
+					}()
+				}
 
 			}
 		}()
@@ -252,6 +284,18 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 	}
 }
 
+func addNewGateway(newGateway string) {
+	gatewayLock.Lock()
+	defer gatewayLock.Unlock()
+
+	for _, gateway := range ipfsGateways {
+		if gateway == newGateway {
+			return
+		}
+	}
+
+	ipfsGateways = append(ipfsGateways, newGateway)
+}
 
 func extractCID(link string) string {
 	if strings.HasPrefix(link, "ipfs://") {
@@ -290,7 +334,11 @@ func convertCIDToHash(cidStr string) (string, error) {
 	c = cid.NewCidV1(c.Type(), c.Hash())
 
 	// base32CID := c.StringOfBase(cid.Base32)
-	base32CID := c.String()
+	// base32CID := c.String()
+	base32CID, err := c.StringOfBase(multibase.Base32)
+	if err != nil {
+		return "", err
+	}
 	
 
 	// Apply SHA-256 and encode as hex
@@ -323,21 +371,21 @@ func main() {
 
 	log.Println("[!!] ipfs links found and saved successfully.")
 
-	ipfsGateways := []string{
-		"https://ipfs.io/ipfs/",
-		"https://cloudflare-ipfs.com/ipfs/",
-		"https://gateway.pinata.cloud/ipfs/",
-		"https://dweb.link/ipfs/",
-		"https://ipfs.eth.aragon.network/ipfs/",
-		"https://trustless-gateway.link/ipfs/",
-		"https://ipfs.runfission.com/ipfs/",
-		"https://4everland.io/ipfs/",
-		"https://w3s.link/ipfs/",
-		"https://nftstorage.link/ipfs/",
-		"https://hardbin.com/ipfs/",
-		"https://storry.tv/ipfs/",
-		"https://cf-ipfs.com/ipfs/",
-	}
+	// ipfsGateways := []string{
+	// 	"https://ipfs.io/ipfs/",
+	// 	"https://cloudflare-ipfs.com/ipfs/",
+	// 	"https://gateway.pinata.cloud/ipfs/",
+	// 	"https://dweb.link/ipfs/",
+	// 	"https://ipfs.eth.aragon.network/ipfs/",
+	// 	"https://trustless-gateway.link/ipfs/",
+	// 	"https://ipfs.runfission.com/ipfs/",
+	// 	"https://4everland.io/ipfs/",
+	// 	"https://w3s.link/ipfs/",
+	// 	"https://nftstorage.link/ipfs/",
+	// 	"https://hardbin.com/ipfs/",
+	// 	"https://storry.tv/ipfs/",
+	// 	"https://cf-ipfs.com/ipfs/",
+	// }
 
 	denyListURL := "https://badbits.dwebops.pub/badbits.deny"
 

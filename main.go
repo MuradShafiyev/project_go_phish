@@ -27,23 +27,54 @@ import (
 
 
 var (
-	ipfsGateways = []string{
-		"https://ipfs.io/ipfs/",
-		"https://cloudflare-ipfs.com/ipfs/",
-		"https://gateway.pinata.cloud/ipfs/",
-		"https://dweb.link/ipfs/",
-		"https://ipfs.eth.aragon.network/ipfs/",
-		"https://trustless-gateway.link/ipfs/",
-		"https://ipfs.runfission.com/ipfs/",
-		"https://4everland.io/ipfs/",
-		"https://w3s.link/ipfs/",
-		"https://nftstorage.link/ipfs/",
-		"https://hardbin.com/ipfs/",
-		"https://storry.tv/ipfs/",
-		"https://cf-ipfs.com/ipfs/",
-	}
-	gatewayLock sync.Mutex
+	ipfsGateways []string
+	gatewayLock  sync.Mutex
 )
+
+func readGatewaysFromFile(filePath string) ([]string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var gateways []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		gateways = append(gateways, scanner.Text())
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return gateways, nil
+}
+
+func addNewGateway(newGateway string) {
+	gatewayLock.Lock()
+	defer gatewayLock.Unlock()
+
+	for _, gateway := range ipfsGateways {
+		if gateway == newGateway {
+			return
+		}
+	}
+
+	ipfsGateways = append(ipfsGateways, newGateway)
+
+
+	file, err := os.OpenFile("ipfs_gateways.txt", os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("Failed to open gateways file: %s", err)
+		return
+	}
+	defer file.Close()
+
+	if _, err := file.WriteString(newGateway + "\n"); err != nil {
+		log.Printf("Failed to write new gateway to file: %s", err)
+	}
+}
 
 var httpClient = &http.Client{
 	Timeout: 10 * time.Second,
@@ -250,7 +281,7 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 					blocked = "yes"
 				}
 
-				
+
 				if anyAvailable {
 					resultRow := append([]string{cidStr, blocked}, statuses...)
 					func() {
@@ -282,19 +313,6 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 	if err := scanner.Err(); err != nil {
 		log.Printf("Error scanning file: %s", err)
 	}
-}
-
-func addNewGateway(newGateway string) {
-	gatewayLock.Lock()
-	defer gatewayLock.Unlock()
-
-	for _, gateway := range ipfsGateways {
-		if gateway == newGateway {
-			return
-		}
-	}
-
-	ipfsGateways = append(ipfsGateways, newGateway)
 }
 
 func extractCID(link string) string {
@@ -358,6 +376,12 @@ func main() {
 	filePathActiveIPFSLinks := "./phishing_db/found-ipfs-phishing-links_ACTIVE.csv"
 	filePathActiveTxt := "./phishing_db/found-ipfs-phishing-links_ACTIVE.txt"
 
+
+	var err error
+	ipfsGateways, err = readGatewaysFromFile("./src/ipfs_gateways.txt")
+	if err != nil {
+		log.Fatalf("Failed to read gateways from file: %s", err)
+	}
 
 	if err := downloadFile(fileURL, filePath); err != nil {
 		log.Fatalf("[!!] error downloading db: %s", err)

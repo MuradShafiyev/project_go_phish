@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"crypto/sha256"
-	// "encoding/base32"
 	"encoding/csv"
 	"flag"
 	"fmt"
@@ -24,7 +23,6 @@ import (
 // date: 09.06.2024
 // added github.com/ipfs/go-cid package
 // go install github.com/ipfs/go-cid@latest
-
 
 var (
 	ipfsGateways []string
@@ -373,8 +371,17 @@ func main() {
 	fileURL := "https://raw.githubusercontent.com/mitchellkrogza/Phishing.Database/master/ALL-phishing-links.txt"
 	filePath := "./phishing_db/ALL-phishing-links.txt"
 	filePathIPFSLinks := "./phishing_db/found-ipfs-phishing-links.txt"
-	filePathActiveIPFSLinks := "./phishing_db/found-ipfs-phishing-links_ACTIVE.csv"
-	filePathActiveTxt := "./phishing_db/found-ipfs-phishing-links_ACTIVE.txt"
+
+	date := time.Now().Format("20060102")
+	filePathActiveIPFSLinks := fmt.Sprintf("./collected_data/%s_found-ipfs-phishing-links_ACTIVE.csv", date)
+	filePathActiveTxt := fmt.Sprintf("./collected_data/%s_found-ipfs-phishing-links_ACTIVE.txt", date)
+
+	//error handling for the collected_data directory
+	if _, err := os.Stat("./collected_data"); os.IsNotExist(err) {
+		if err := os.Mkdir("./collected_data", 0755); err != nil {
+			log.Fatalf("Failed to create collected_data directory: %s", err)
+		}
+	}
 
 
 	var err error
@@ -394,22 +401,6 @@ func main() {
 	}
 
 	log.Println("[!!] ipfs links found and saved successfully.")
-
-	// ipfsGateways := []string{
-	// 	"https://ipfs.io/ipfs/",
-	// 	"https://cloudflare-ipfs.com/ipfs/",
-	// 	"https://gateway.pinata.cloud/ipfs/",
-	// 	"https://dweb.link/ipfs/",
-	// 	"https://ipfs.eth.aragon.network/ipfs/",
-	// 	"https://trustless-gateway.link/ipfs/",
-	// 	"https://ipfs.runfission.com/ipfs/",
-	// 	"https://4everland.io/ipfs/",
-	// 	"https://w3s.link/ipfs/",
-	// 	"https://nftstorage.link/ipfs/",
-	// 	"https://hardbin.com/ipfs/",
-	// 	"https://storry.tv/ipfs/",
-	// 	"https://cf-ipfs.com/ipfs/",
-	// }
 
 	denyListURL := "https://badbits.dwebops.pub/badbits.deny"
 

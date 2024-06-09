@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"encoding/csv"
 	"flag"
 	"fmt"
@@ -14,10 +15,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	cid "github.com/ipfs/go-cid"
 )
 
+// date: 09.06.2024
+// added github.com/ipfs/go-cid package
+// go install github.com/ipfs/go-cid@latest
+
 var httpClient = &http.Client{
-	Timeout: 10 * time.Second, 
+	Timeout: 10 * time.Second,
 }
 
 func downloadFile(url string, filePathStr string) error {
@@ -35,7 +42,7 @@ func downloadFile(url string, filePathStr string) error {
 	defer out.Close()
 
 	resp, err := http.Get(url)
-	if err != nil {	
+	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
@@ -58,13 +65,11 @@ func findIPFSLinks(filePathStr string, outputFilePath string) error {
 	}
 	defer file.Close()
 
-
 	outputFile, err := os.Create(outputFilePath)
 	if err != nil {
 		return err
 	}
 	defer outputFile.Close()
-
 
 	var ipfsLinks []string
 
@@ -84,131 +89,159 @@ func findIPFSLinks(filePathStr string, outputFilePath string) error {
 		}
 	}
 
-	if err:= scanner.Err(); err != nil {
+	if err := scanner.Err(); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string, extract bool) {
+func fetchAndParseDenyList(url string) (map[string]bool, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bad status: %s", resp.Status)
+	}
+
+	denyList := make(map[string]bool)
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "//") {
+			denyList[line[2:]] = true
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return denyList, nil
+}
+
+func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string, filePathActiveTxt string, denyListURL string) {
+	//fetching deny list
+	denyList, err := fetchAndParseDenyList(denyListURL)
+	if err != nil {
+		log.Fatalf("Failed to fetch deny list: %s", err)
+	}
+
 	file, err := os.Open(filePathStr)
 	if err != nil {
 		log.Fatalf("Failed to open file: %s", err)
 	}
 	defer file.Close()
 
-	// fileActive, err := os.Create(filePathActive)
-	// if err != nil {
-	// 	log.Fatalf("Failed to create file: %s", err)
-	// }
-	// defer fileActive.Close()
-
-	var fileActive *os.File
-	var csvWriter *csv.Writer
-	if extract {
-		_, err := os.Stat(filePathActive)
-		isNewFile := os.IsNotExist(err)
-		fileActive, err := os.OpenFile(filePathActive, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			log.Printf("Failed to create or open file: %s", err)
-		}
-		defer fileActive.Close()
-		csvWriter = csv.NewWriter(fileActive)
-		defer csvWriter.Flush()
-
-		if isNewFile{
-			if err := csvWriter.Write([]string{"URL", "Status"}); err != nil {
-				log.Printf("Failed to write CSV header: %s", err)
-			}
-		}
-	} else {
-		fileActive, err := os.Create(filePathActive)
-		if err != nil {
-			log.Printf("Failed to create file: %s", err)
-			return
-		}
-		defer fileActive.Close()
+	fileActiveTxt, err := os.Create(filePathActiveTxt)
+	if err != nil {
+		log.Fatalf("Failed to create text file: %s", err)
 	}
+	defer fileActiveTxt.Close()
 
+	fileActive, err := os.Create(filePathActive)
+	if err != nil {
+		log.Fatalf("Failed to create CSV file: %s", err)
+	}
+	defer fileActive.Close()
+	csvWriter := csv.NewWriter(fileActive)
+	defer csvWriter.Flush()
+
+	// Write CSV header
+	header := append([]string{"CID", "Blocked"}, gateways...)
+	if err := csvWriter.Write(header); err != nil {
+		log.Fatalf("Failed to write CSV header: %s", err)
+	}
 
 	ipfsRegex := regexp.MustCompile(`(ipfs://\S+|https?://[^\s]+/ipfs/[a-zA-Z0-9]+[^\s]*)`)
 	scanner := bufio.NewScanner(file)
 
-
 	var wg sync.WaitGroup
 	linkChannel := make(chan string)
 
+	processedCIDs := make(map[string]bool)
+	var resultsLock sync.Mutex
+
+	// Launch goroutines to send requests
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
-		go func ()  {
+		go func() {
 			defer wg.Done()
-			for link := range linkChannel{
-				cid := extractCID(link)
-				for _, gateway := range gateways {
-					url := gateway + cid
+			for link := range linkChannel {
+				cidStr := extractCID(link)
+
+				resultsLock.Lock()
+				if processedCIDs[cidStr] {
+					resultsLock.Unlock()
+					continue
+				}
+				processedCIDs[cidStr] = true
+				resultsLock.Unlock()
+
+				statuses := make([]string, len(gateways))
+				// anyAvailable := false
+				for i, gateway := range gateways {
+					url := gateway + cidStr
 					status, err := sendReq(url)
 					if err != nil {
 						log.Printf("[XX] Failed to fetch %s: %s", url, err)
+						statuses[i] = "-"
 						continue
 					}
 
-					var statusText string 
 					if status == http.StatusOK {
 						log.Printf("[++] Content is available at %s", url)
-						statusText = "available"
-					} else if status == http.StatusForbidden {
-						log.Printf("[--] Content is blocked at %s", url)
-						// statusText = "blocked"
+						statuses[i] = "+"
+						// anyAvailable = true
+
+						resultsLock.Lock()
+						if _, err := fileActiveTxt.WriteString(url + "\n"); err != nil {
+							log.Printf("Failed to write active link to the text file: %s", err)
+						}
+						resultsLock.Unlock()
 					} else {
 						log.Printf("[!!] Content not found at %s", url)
-						// statusText = "not found"
-					}
-
-					if extract {
-						if err := csvWriter.Write([]string{url, cid}); err != nil {
-							log.Printf("[XX] Failed to write link to the CSV file: %s", err)
-						}
-					} else {
-						if statusText == "available" {
-							if _, err := fileActive.WriteString(url + "available"); err != nil {
-								log.Printf("Failed to write active link to the file: %s", err)
-							}
-						}
+						statuses[i] = "-"
 					}
 				}
+
+
+				//Converting CID to hash & checking with Bad Bits Denylist
+				hashedCID, err := convertCIDToHash(cidStr)
+				if err != nil {
+					log.Printf("Failed to convert CID to hash: %s", err)
+					continue
+				}
+				blocked := "no"
+				if denyList[hashedCID] {
+					blocked = "yes"
+				}
+
+				resultRow := append([]string{cidStr, blocked}, statuses...)
+
+				func() {
+					resultsLock.Lock()
+					defer resultsLock.Unlock()
+					if err := csvWriter.Write(resultRow); err != nil {
+						log.Printf("Failed to write row to the CSV file: %s", err)
+					}
+					csvWriter.Flush()
+				}()
+
 			}
 		}()
 	}
 
+	// Read links and send them to the channel
 	for scanner.Scan() {
 		line := scanner.Text()
 		matches := ipfsRegex.FindAllString(line, -1)
-
 		for _, match := range matches {
 			linkChannel <- match
 		}
-		// for _, match := range matches {
-		// 	cid := extractCID(match)
-		// 	for _, gateway := range gateways {
-		// 		url := gateway + cid
-		// 		resp, err := sendReq(url)
-		// 		if err != nil {
-		// 			log.Printf("Failed to fetch %s: %s", url, err)
-		// 			continue
-		// 		}
-				
-		// 		if resp == http.StatusOK {
-		// 			log.Printf("[--] Content is available at --> %s", url)
-		// 			if _, err := fileActive.WriteString(url + "\n"); err != nil {
-		// 				log.Printf("Failed to write active link to the file: %s", err)
-		// 			}
-		// 		} else {
-		// 			log.Printf("[!] Content not found at - %s", url)
-		// 		}
-		// 		// resp.Body.Close()
-		// 	}
-		// }
 	}
 	close(linkChannel)
 
@@ -219,7 +252,8 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 	}
 }
 
-func extractCID(link string) string{
+
+func extractCID(link string) string {
 	if strings.HasPrefix(link, "ipfs://") {
 		return strings.TrimPrefix(link, "ipfs://")
 	}
@@ -229,7 +263,7 @@ func extractCID(link string) string{
 		return ""
 	}
 	cidPart := parts[1]
-	if pos:= strings.IndexAny(cidPart, " ?#"); pos >= 0 {
+	if pos := strings.IndexAny(cidPart, " ?#"); pos >= 0 {
 		cidPart = cidPart[:pos]
 	}
 	return cidPart
@@ -244,6 +278,27 @@ func sendReq(url string) (int, error) {
 	return resp.StatusCode, nil
 }
 
+func convertCIDToHash(cidStr string) (string, error) {
+	// Parse the CID
+	c, err := cid.Decode(cidStr)
+	if err != nil {
+		return "", err
+	}
+
+	// Convert to CIDv1 and encode as base32
+	// c = c.ToV1() -- this is not supported in the newer version
+	c = cid.NewCidV1(c.Type(), c.Hash())
+
+	// base32CID := c.StringOfBase(cid.Base32)
+	base32CID := c.String()
+	
+
+	// Apply SHA-256 and encode as hex
+	hash := sha256.Sum256([]byte(base32CID))
+	return fmt.Sprintf("%x", hash), nil
+}
+
+
 func main() {
 	var extract bool
 	flag.BoolVar(&extract, "e", false, "extract results live in CSV format")
@@ -252,11 +307,9 @@ func main() {
 	fileURL := "https://raw.githubusercontent.com/mitchellkrogza/Phishing.Database/master/ALL-phishing-links.txt"
 	filePath := "./phishing_db/ALL-phishing-links.txt"
 	filePathIPFSLinks := "./phishing_db/found-ipfs-phishing-links.txt"
-	filePathActiveIPFSLinks := "./phishing_db/found-ipfs-phishing-links_ACTIVE.txt"
+	filePathActiveIPFSLinks := "./phishing_db/found-ipfs-phishing-links_ACTIVE.csv"
+	filePathActiveTxt := "./phishing_db/found-ipfs-phishing-links_ACTIVE.txt"
 
-	if extract {
-		filePathActiveIPFSLinks = "./phishing_db/active.csv"
-	}
 
 	if err := downloadFile(fileURL, filePath); err != nil {
 		log.Fatalf("[!!] error downloading db: %s", err)
@@ -264,19 +317,11 @@ func main() {
 
 	log.Println("[++] DB downloaded successfully")
 
-	
 	if err := findIPFSLinks(filePath, filePathIPFSLinks); err != nil {
 		log.Fatalf("Failed to find ipfs links: %s", err)
 	}
 
 	log.Println("[!!] ipfs links found and saved successfully.")
-
-	// ipfsLinks, err := findIPFSLinks(filePath, filePathIPFSLinks)
-	// if err != nil {
-	// 	log.Fatalf("Failed to find ipfs links: %s", err)
-	// }
-	// log.Printf("Found ipfs links: %v", ipfsLinks)
-
 
 	ipfsGateways := []string{
 		"https://ipfs.io/ipfs/",
@@ -293,5 +338,8 @@ func main() {
 		"https://storry.tv/ipfs/",
 		"https://cf-ipfs.com/ipfs/",
 	}
-	checkIPFSLinks(filePathIPFSLinks, ipfsGateways, filePathActiveIPFSLinks, extract)
+
+	denyListURL := "https://badbits.dwebops.pub/badbits.deny"
+
+	checkIPFSLinks(filePathIPFSLinks, ipfsGateways, filePathActiveIPFSLinks, filePathActiveTxt, denyListURL)
 }

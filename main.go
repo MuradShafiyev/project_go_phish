@@ -423,8 +423,36 @@ func convertCIDToHash(cidStr string) (string, error) {
 	return fmt.Sprintf("%x", hash), nil
 }
 
+func initLogger()  {
+	date := time.Now().Format("20060102")
+	counter := 1
+
+	var logFilePath string
+	for {
+		logFilePath = fmt.Sprintf("./log/%s_%d.log", date, counter)
+		if _, err := os.Stat(logFilePath); os.IsNotExist(err) {
+			break
+		}
+		counter++
+	}
+
+	if _, err := os.Stat("./log"); os.IsNotExist(err) {
+		if err := os.Mkdir("./log", 0755); err != nil {
+			log.Fatalf("Failed to create log directory: %s", err)
+		}
+	}
+
+	logFile, err := os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("Failed to create log file: %s", err)
+	}
+
+	log.SetOutput(io.MultiWriter(os.Stdout, logFile))
+}
 
 func main() {
+	initLogger()
+
 	var extract bool
 	flag.BoolVar(&extract, "e", false, "extract results live in CSV format")
 	flag.Parse()
@@ -433,15 +461,25 @@ func main() {
 	filePath := "./phishing_db/ALL-phishing-links.txt"
 	filePathIPFSLinks := "./phishing_db/found-ipfs-phishing-links.txt"
 
-	date := time.Now().Format("20060102")
-	filePathActiveIPFSLinks := fmt.Sprintf("./collected_data/%s_found-ipfs-phishing-links_ACTIVE.csv", date)
-	filePathActiveTxt := fmt.Sprintf("./collected_data/%s_found-ipfs-phishing-links_ACTIVE.txt", date)
-
 	//error handling for the collected_data directory
 	if _, err := os.Stat("./collected_data"); os.IsNotExist(err) {
 		if err := os.Mkdir("./collected_data", 0755); err != nil {
 			log.Fatalf("Failed to create collected_data directory: %s", err)
 		}
+	}
+
+	
+	date := time.Now().Format("20060102")
+	counter := 1
+	// var filePathActiveIPFSLinks, 
+	var filePathActiveIPFSLinks, filePathActiveTxt string
+	for {
+		filePathActiveIPFSLinks = fmt.Sprintf("./collected_data/%s_found-ipfs-phishing-links_ACTIVE_%d.csv", date, counter)
+		filePathActiveTxt = fmt.Sprintf("./collected_data/%s_found-ipfs-phishing-links_ACTIVE_%d.txt", date, counter)
+		if _, err := os.Stat(filePathActiveIPFSLinks); os.IsNotExist(err) {
+			break
+		}
+		counter++	
 	}
 
 

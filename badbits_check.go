@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ipfs/go-cid"
 	"github.com/minio/sha256-simd"
-	cid "github.com/ipfs/go-cid"
 )
 
 const denyListURL = "https://badbits.dwebops.pub/badbits.deny"
@@ -71,7 +71,7 @@ func fetchAndParseDenyList(filePath string) (map[string]bool, error) {
 func convertCIDToBadBitsFormat(cidStr string) (string, error) {
 	// Format the line into an ipfs:// URI
 	// if strings.HasPrefix(cidStr, "/ipfs/") {
-	// 	cidStr = cidStr[len("/ipfs/"):]
+	// 	cidStr = strings.TrimPrefix(cidStr, "/ipfs/")
 	// }
 	cidStr = strings.TrimPrefix(cidStr, "/ipfs/")
 
@@ -112,7 +112,6 @@ func convertCIDToBadBitsFormat(cidStr string) (string, error) {
 	return encoded, nil
 }
 
-
 func findLatestCSV(directory string) (string, error) {
 	var latestFile string
 	var latestTime time.Time
@@ -121,7 +120,7 @@ func findLatestCSV(directory string) (string, error) {
 		if err != nil {
 			return err
 		}
-		if !info.IsDir() && strings.HasSuffix(info.Name(), ".csv") {
+		if !info.IsDir() && strings.Contains(info.Name(), "_found-ipfs-phishing-links_ACTIVE_") && strings.HasSuffix(info.Name(), ".csv") {
 			if info.ModTime().After(latestTime) {
 				latestTime = info.ModTime()
 				latestFile = path
@@ -135,13 +134,13 @@ func findLatestCSV(directory string) (string, error) {
 	}
 
 	if latestFile == "" {
-		return "", fmt.Errorf("no CSV files found in directory: %s", directory)
+		return "", fmt.Errorf("no matching CSV files found in directory: %s", directory)
 	}
 
 	return latestFile, nil
 }
 
-func main_check() {
+func checkBadBits() {
 	denyListFile := "src/badbits.deny"
 	if err := downloadBadBitsList(denyListURL, denyListFile); err != nil {
 		log.Fatalf("Failed to download bad bits denylist: %s", err)
@@ -167,18 +166,17 @@ func main_check() {
 	defer file.Close()
 
 	date := time.Now().Format("20060102")
+	var outputPath string
 	counter := 1
-	var outputCSV string
 	for {
-		outputCSV = fmt.Sprintf("%s_badbits_check_%d.csv", date, counter)
-		outputPath := filepath.Join(collectedDataDir, outputCSV)
+		outputCSV := fmt.Sprintf("%s_badbits_check_%d.csv", date, counter)
+		outputPath = filepath.Join(collectedDataDir, outputCSV)
 		if _, err := os.Stat(outputPath); os.IsNotExist(err) {
 			break
 		}
 		counter++
 	}
-	
-	outputPath := filepath.Join(collectedDataDir, outputCSV)
+
 	outFile, err := os.Create(outputPath)
 	if err != nil {
 		log.Fatalf("Failed to create output CSV file: %s", err)
@@ -191,29 +189,34 @@ func main_check() {
 		log.Fatalf("Failed to write CSV header: %s", err)
 	}
 
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		fields := strings.Split(line, ",")
-		if len(fields) > 0 {
-			cidStr := fields[0]
-			hashedCID, err := convertCIDToBadBitsFormat(cidStr)
-			if err != nil {
-				log.Printf("Failed to convert CID to bad bits format: %s", err)
-				continue
-			}
-			badBits := "-"
-			if denyList[hashedCID] {
-				badBits = "+"
-			}
-			if err := csvWriter.Write([]string{cidStr, badBits}); err != nil {
-				log.Printf("Failed to write row to the CSV file: %s", err)
-			}
-		}
+	reader := csv.NewReader(file)
+	_, err = reader.Read() // skip header
+	if err != nil {
+		log.Fatalf("Failed to read CSV header: %s", err)
 	}
 
-	if err := scanner.Err(); err != nil {
-		log.Fatalf("Error scanning file: %s", err)
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Fatalf("Failed to read CSV record: %s", err)
+		}
+
+		cidStr := record[0]
+		hashedCID, err := convertCIDToBadBitsFormat(cidStr)
+		if err != nil {
+			log.Printf("Failed to convert CID to bad bits format: %s", err)
+			continue
+		}
+		badBits := "-"
+		if denyList[hashedCID] {
+			badBits = "+"
+		}
+		if err := csvWriter.Write([]string{cidStr, badBits}); err != nil {
+			log.Printf("Failed to write row to the CSV file: %s", err)
+		}
 	}
 
 	log.Printf("Bad bits check completed. Results saved to: %s", outputPath)

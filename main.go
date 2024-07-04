@@ -513,5 +513,5 @@ func main() {
 
 	checkIPFSLinks(filePathIPFSLinks, ipfsGateways, filePathActiveIPFSLinks, filePathActiveTxt)
 
-	main_check()
+	checkBadBits()
 }

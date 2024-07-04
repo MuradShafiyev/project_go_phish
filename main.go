@@ -62,7 +62,7 @@ func addNewGateway(newGateway string) {
 	ipfsGateways = append(ipfsGateways, newGateway)
 
 
-	file, err := os.OpenFile("ipfs_gateways.txt", os.O_APPEND|os.O_WRONLY, 0644)
+	file, err := os.OpenFile("./src/ipfs_gateways.txt", os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Printf("Failed to open gateways file: %s", err)
 		return
@@ -173,7 +173,7 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 	csvWriter := csv.NewWriter(fileActive)
 	defer csvWriter.Flush()
 
-	// Write CSV header
+	// Writes CSV header
 	header := append([]string{"CID", "accessibleOnIPFS"}, gateways...)
 	if err := csvWriter.Write(header); err != nil {
 		log.Fatalf("Failed to write CSV header: %s", err)
@@ -212,7 +212,7 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 	processedCIDs := make(map[string]bool)
 	var resultsLock sync.Mutex
 
-	// Launch goroutines to send requests
+	//Launching goroutines to send requests
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func() {
@@ -232,10 +232,6 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 				matches := make([]string, len(gateways))
 				anyAvailable := false
 				matchWithIPFS := false
-
-				// var httpContent, ipfsContent []byte
-				// contentMatch := "unknown"
-				// existsOnIPFS := "-"
 
 				ipfsContent, err := fetchContentFromIPFS(cidStr)
 				if err != nil {
@@ -264,7 +260,7 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 						}
 						resultsLock.Unlock()
 
-						// Fetch content from HTTP
+						//fetching content from HTTP
 						httpContent, err := fetchContentFromHTTP(url)
 						if err != nil {
 							log.Printf("Failed to fetch content from HTTP for URL %s: %s", url, err)
@@ -272,7 +268,7 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 							continue
 						}
 
-						// Compare hashes
+						//Comparing hashes
 						if ipfsContent != nil {
 							ipfsHash := hashData(ipfsContent)
 							httpHash := hashData(httpContent)
@@ -286,18 +282,6 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 							matches[i] = "-"
 						}
 
-						// existsOnIPFS = "+"
-						// if compareContents(httpContent, ipfsContent) {
-						// 	contentMatch = "match"
-						// } else {
-						// 	contentMatch = "mismatch"
-						// }
-
-						// resultsLock.Lock()
-						// if _, err := fileActiveTxt.WriteString(url + "\n"); err != nil {
-						// 	log.Printf("Failed to write active link to the text file: %s", err)
-						// }
-						// resultsLock.Unlock()
 					} else if status == http.StatusGone || status == http.StatusUnavailableForLegalReasons {
 						log.Printf("[!!!] Content blocked at %s with status %d", url, status)
 						statuses[i] = "x"
@@ -309,7 +293,7 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 					}
 				}
 
-				// Checking for additional/new gateways in the found IPFS links and adding them to the IPFS gateways list
+				//Checking for additional/new gateways in the found IPFS links and adding to the IPFS gateways list
 				if strings.HasPrefix(link, "http://") || strings.HasPrefix(link, "https://") {
 					parts := strings.Split(link, "/ipfs/")
 					if len(parts) > 1 {
@@ -317,18 +301,6 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 						addNewGateway(baseURL)
 					}
 				}
-
-				// if anyAvailable {					
-				// 	resultRow := append([]string{cidStr, existsOnIPFS,contentMatch}, statuses...)
-				// 	func() {
-				// 		resultsLock.Lock()
-				// 		defer resultsLock.Unlock()
-				// 		if err := csvWriter.Write(resultRow); err != nil {
-				// 			log.Printf("Failed to write row to the CSV file: %s", err)
-				// 		}
-				// 		csvWriter.Flush()
-				// 	}()
-				// }
 
 
 				if anyAvailable {
@@ -369,7 +341,7 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 		}()
 	}
 
-	// Read links and send them to the channel
+	//reading links and send to channel
 	for scanner.Scan() {
 		line := scanner.Text()
 		matches := ipfsRegex.FindAllString(line, -1)
@@ -445,10 +417,6 @@ func fetchContentFromIPFS(cidStr string) ([]byte, error) {
 
 	return content, nil
 }
-
-// func compareContents(a, b []byte) bool {
-// 	return sha256.Sum256(a) == sha256.Sum256(b)
-// }
 
 func initLogger()  {
 	date := time.Now().Format("20060102")

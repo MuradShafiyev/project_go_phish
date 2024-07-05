@@ -152,7 +152,131 @@ func hashData(data []byte) string {
 	return hex.EncodeToString(hash[:])
 }
 
-func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string, filePathActiveTxt string) {
+func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchContentWriter *csv.Writer, fileActiveTxt *os.File, resultsLock *sync.Mutex, processedCIDs map[string]bool) {
+	for link := range linkChannel {
+		cidStr := extractCID(link)
+
+		resultsLock.Lock()
+		if processedCIDs[cidStr] {
+			resultsLock.Unlock()
+			continue
+		}
+		processedCIDs[cidStr] = true
+		resultsLock.Unlock()
+
+		statuses := make([]string, len(gateways))
+		matches := make([]string, len(gateways))
+		anyAvailable := false
+		matchWithIPFS := false
+
+		ipfsContent, err := fetchContentFromIPFS(cidStr)
+		if err != nil {
+			log.Printf("Failed to fetch content from IPFS for CID %s: %s", cidStr, err)
+			ipfsContent = nil
+		}
+
+		for i, gateway := range gateways {
+			url := gateway + cidStr
+			status, err := sendReq(url)
+			if err != nil {
+				log.Printf("[XX] Failed to fetch %s: %s", url, err)
+				statuses[i] = "-"
+				matches[i] = "-"
+				continue
+			}
+
+			if status == http.StatusOK {
+				log.Printf("[++] Content is available at %s", url)
+				statuses[i] = "+"
+				anyAvailable = true
+
+				resultsLock.Lock()
+				if _, err := fileActiveTxt.WriteString(url + "\n"); err != nil {
+					log.Printf("Failed to write active link to the text file: %s", err)
+				}
+				resultsLock.Unlock()
+
+				//fetching content from HTTP
+				httpContent, err := fetchContentFromHTTP(url)
+				if err != nil {
+					log.Printf("Failed to fetch content from HTTP for URL %s: %s", url, err)
+					matches[i] = "-"
+					continue
+				}
+
+				//Comparing hashes
+				if ipfsContent != nil {
+					ipfsHash := hashData(ipfsContent)
+					httpHash := hashData(httpContent)
+					if ipfsHash == httpHash {
+						matches[i] = "+"
+						matchWithIPFS = true
+					} else {
+						matches[i] = "-"
+					}
+				} else {
+					matches[i] = "-"
+				}
+
+			} else if status == http.StatusGone || status == http.StatusUnavailableForLegalReasons {
+				log.Printf("[!!!] Content blocked at %s with status %d", url, status)
+				statuses[i] = "x"
+				matches[i] = "x"
+			} else {
+				log.Printf("[!!] Content not found at %s", url)
+				statuses[i] = "-"
+				matches[i] = "-"
+			}
+		}
+
+		//Checking for additional/new gateways in the found IPFS links and adding to the IPFS gateways list
+		if strings.HasPrefix(link, "http://") || strings.HasPrefix(link, "https://") {
+			parts := strings.Split(link, "/ipfs/")
+			if len(parts) > 1 {
+				baseURL := parts[0] + "/ipfs/"
+				addNewGateway(baseURL)
+			}
+		}
+
+
+		if anyAvailable {
+			resultRow := append([]string{cidStr, "+"}, statuses...)
+			func() {
+				resultsLock.Lock()
+				defer resultsLock.Unlock()
+				if err := csvWriter.Write(resultRow); err != nil {
+					log.Printf("Failed to write row to the CSV file: %s", err)
+				}
+				csvWriter.Flush()
+			}()
+		} else {
+			resultRow := append([]string{cidStr, "-"}, statuses...)
+			func() {
+				resultsLock.Lock()
+				defer resultsLock.Unlock()
+				if err := csvWriter.Write(resultRow); err != nil {
+					log.Printf("Failed to write row to the CSV file: %s", err)
+				}
+				csvWriter.Flush()
+			}()
+		}
+
+
+		if matchWithIPFS {
+			matchContentRow := append([]string{cidStr}, matches...)
+			func() {
+				resultsLock.Lock()
+				defer resultsLock.Unlock()
+				if err := matchContentWriter.Write(matchContentRow); err != nil {
+					log.Printf("Failed to write row to the match content CSV file: %s", err)
+				}
+				matchContentWriter.Flush()
+			}()
+		}
+	}
+}
+
+func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string, filePathActiveTxt string, phishingCIDsFilePath string) {
 	file, err := os.Open(filePathStr)
 	if err != nil {
 		log.Fatalf("Failed to open file: %s", err)
@@ -173,12 +297,6 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 	csvWriter := csv.NewWriter(fileActive)
 	defer csvWriter.Flush()
 
-	// Writes CSV header
-	header := append([]string{"CID", "accessibleOnIPFS"}, gateways...)
-	if err := csvWriter.Write(header); err != nil {
-		log.Fatalf("Failed to write CSV header: %s", err)
-	}
-
 	date := time.Now().Format("20060102")
 	counter := 1
 	var filePathMatchContent string
@@ -198,6 +316,11 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 	matchContentWriter := csv.NewWriter(fileMatchContent)
 	defer matchContentWriter.Flush()
 
+	// Writes CSV headers
+	header := append([]string{"CID", "accessibleOnIPFS"}, gateways...)
+	if err := csvWriter.Write(header); err != nil {
+		log.Fatalf("Failed to write CSV header: %s", err)
+	}
 	matchContentHeader := append([]string{"CID"}, gateways...)
 	if err := matchContentWriter.Write(matchContentHeader); err != nil {
 		log.Fatalf("Failed to write match content CSV header: %s", err)
@@ -217,127 +340,7 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for link := range linkChannel {
-				cidStr := extractCID(link)
-
-				resultsLock.Lock()
-				if processedCIDs[cidStr] {
-					resultsLock.Unlock()
-					continue
-				}
-				processedCIDs[cidStr] = true
-				resultsLock.Unlock()
-
-				statuses := make([]string, len(gateways))
-				matches := make([]string, len(gateways))
-				anyAvailable := false
-				matchWithIPFS := false
-
-				ipfsContent, err := fetchContentFromIPFS(cidStr)
-				if err != nil {
-					log.Printf("Failed to fetch content from IPFS for CID %s: %s", cidStr, err)
-					ipfsContent = nil
-				}
-
-				for i, gateway := range gateways {
-					url := gateway + cidStr
-					status, err := sendReq(url)
-					if err != nil {
-						log.Printf("[XX] Failed to fetch %s: %s", url, err)
-						statuses[i] = "-"
-						matches[i] = "-"
-						continue
-					}
-
-					if status == http.StatusOK {
-						log.Printf("[++] Content is available at %s", url)
-						statuses[i] = "+"
-						anyAvailable = true
-
-						resultsLock.Lock()
-						if _, err := fileActiveTxt.WriteString(url + "\n"); err != nil {
-							log.Printf("Failed to write active link to the text file: %s", err)
-						}
-						resultsLock.Unlock()
-
-						//fetching content from HTTP
-						httpContent, err := fetchContentFromHTTP(url)
-						if err != nil {
-							log.Printf("Failed to fetch content from HTTP for URL %s: %s", url, err)
-							matches[i] = "-"
-							continue
-						}
-
-						//Comparing hashes
-						if ipfsContent != nil {
-							ipfsHash := hashData(ipfsContent)
-							httpHash := hashData(httpContent)
-							if ipfsHash == httpHash {
-								matches[i] = "+"
-								matchWithIPFS = true
-							} else {
-								matches[i] = "-"
-							}
-						} else {
-							matches[i] = "-"
-						}
-
-					} else if status == http.StatusGone || status == http.StatusUnavailableForLegalReasons {
-						log.Printf("[!!!] Content blocked at %s with status %d", url, status)
-						statuses[i] = "x"
-						matches[i] = "x"
-					} else {
-						log.Printf("[!!] Content not found at %s", url)
-						statuses[i] = "-"
-						matches[i] = "-"
-					}
-				}
-
-				//Checking for additional/new gateways in the found IPFS links and adding to the IPFS gateways list
-				if strings.HasPrefix(link, "http://") || strings.HasPrefix(link, "https://") {
-					parts := strings.Split(link, "/ipfs/")
-					if len(parts) > 1 {
-						baseURL := parts[0] + "/ipfs/"
-						addNewGateway(baseURL)
-					}
-				}
-
-
-				if anyAvailable {
-					resultRow := append([]string{cidStr, "+"}, statuses...)
-					func() {
-						resultsLock.Lock()
-						defer resultsLock.Unlock()
-						if err := csvWriter.Write(resultRow); err != nil {
-							log.Printf("Failed to write row to the CSV file: %s", err)
-						}
-						csvWriter.Flush()
-					}()
-				} else {
-					resultRow := append([]string{cidStr, "-"}, statuses...)
-					func() {
-						resultsLock.Lock()
-						defer resultsLock.Unlock()
-						if err := csvWriter.Write(resultRow); err != nil {
-							log.Printf("Failed to write row to the CSV file: %s", err)
-						}
-						csvWriter.Flush()
-					}()
-				}
-
-
-				if matchWithIPFS {
-					matchContentRow := append([]string{cidStr}, matches...)
-					func() {
-						resultsLock.Lock()
-						defer resultsLock.Unlock()
-						if err := matchContentWriter.Write(matchContentRow); err != nil {
-							log.Printf("Failed to write row to the match content CSV file: %s", err)
-						}
-						matchContentWriter.Flush()
-					}()
-				}
-			}
+			processCIDs(linkChannel, gateways, csvWriter, matchContentWriter, fileActiveTxt, &resultsLock, processedCIDs)
 		}()
 	}
 
@@ -349,13 +352,29 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 			linkChannel <- match
 		}
 	}
-	close(linkChannel)
-
-	wg.Wait()
-
 	if err := scanner.Err(); err != nil {
 		log.Printf("Error scanning file: %s", err)
 	}
+
+	// Read CIDs from the 'phishing_cids.csv' file and send them to the channel
+	phishingCIDsFile, err := os.Open(phishingCIDsFilePath)
+	if err != nil {
+		log.Fatalf("Failed to open phishing CIDs file: %s", err)
+	}
+	defer phishingCIDsFile.Close()
+
+	phishingCIDsScanner := bufio.NewScanner(phishingCIDsFile)
+	for phishingCIDsScanner.Scan() {
+		cid := phishingCIDsScanner.Text()
+		linkChannel <- cid
+	}
+	if err := phishingCIDsScanner.Err(); err != nil {
+		log.Printf("Error scanning phishing CIDs file: %s", err)
+	}
+
+
+	close(linkChannel)
+	wg.Wait()
 }
 
 func extractCID(link string) string {
@@ -470,6 +489,7 @@ func main() {
 	fileURL := "https://raw.githubusercontent.com/mitchellkrogza/Phishing.Database/master/ALL-phishing-links.txt"
 	filePath := "./phishing_db/ALL-phishing-links.txt"
 	filePathIPFSLinks := "./phishing_db/found-ipfs-phishing-links.txt"
+	phishingCIDsFile := "./src/phishing_cids.csv"
 
 	//error handling for the collected_data directory
 	if _, err := os.Stat("./collected_data"); os.IsNotExist(err) {
@@ -492,7 +512,6 @@ func main() {
 		counter++	
 	}
 
-
 	var err error
 	ipfsGateways, err = readGatewaysFromFile("./src/ipfs_gateways.txt")
 	if err != nil {
@@ -511,7 +530,7 @@ func main() {
 
 	log.Println("[!!] ipfs links found and saved successfully.")
 
-	checkIPFSLinks(filePathIPFSLinks, ipfsGateways, filePathActiveIPFSLinks, filePathActiveTxt)
+	checkIPFSLinks(filePathIPFSLinks, ipfsGateways, filePathActiveIPFSLinks, filePathActiveTxt, phishingCIDsFile)
 
 	checkBadBits()
 }

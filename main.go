@@ -174,6 +174,7 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 			log.Printf("Failed to fetch content from IPFS for CID %s: %s", cidStr, err)
 			ipfsContent = nil
 		}
+		ipfsHash := hashData(ipfsContent)
 
 		for i, gateway := range gateways {
 			url := gateway + cidStr
@@ -205,18 +206,17 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 				}
 
 				//Comparing hashes
-				if ipfsContent != nil {
-					ipfsHash := hashData(ipfsContent)
-					httpHash := hashData(httpContent)
-					if ipfsHash == httpHash {
-						matches[i] = "+"
-						matchWithIPFS = true
-					} else {
-						matches[i] = "-"
-					}
+				// if ipfsContent != nil {
+				httpHash := hashData(httpContent)
+				if ipfsHash == httpHash {
+					matches[i] = "+"
+					matchWithIPFS = true
 				} else {
 					matches[i] = "-"
 				}
+				// } else {
+					// matches[i] = "-"
+				// }
 
 			} else if status == http.StatusGone || status == http.StatusUnavailableForLegalReasons {
 				log.Printf("[!!!] Content blocked at %s with status %d", url, status)

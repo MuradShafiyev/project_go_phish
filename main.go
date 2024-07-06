@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"encoding/csv"
+	"context"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -171,7 +172,7 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 		anyAvailable := false
 		matchWithIPFS := false
 
-		ipfsContent, err := fetchContentFromIPFS(cidStr)
+		ipfsContent, err := fetchContentFromIPFS(cidStr, 30*time.Second)
 		if err != nil {
 			log.Printf("Failed to fetch content from IPFS for CID %s: %s", cidStr, err)
 			ipfsContent = nil
@@ -423,7 +424,26 @@ func fetchContentFromHTTP(url string) ([]byte, error) {
 	return data, nil
 }
 
-func fetchContentFromIPFS(cidStr string) ([]byte, error) {
+// func fetchContentFromIPFS(cidStr string) ([]byte, error) {
+// 	sh := shell.NewShell("localhost:5001")
+// 	rc, err := sh.Cat(cidStr)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	defer rc.Close()
+
+// 	content, err := io.ReadAll(rc)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	return content, nil
+// }
+
+func fetchContentFromIPFS(cidStr string, timeout time.Duration) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	sh := shell.NewShell("localhost:5001")
 	rc, err := sh.Cat(cidStr)
 	if err != nil {
@@ -431,12 +451,19 @@ func fetchContentFromIPFS(cidStr string) ([]byte, error) {
 	}
 	defer rc.Close()
 
-	content, err := io.ReadAll(rc)
-	if err != nil {
-		return nil, err
-	}
+	done := make(chan struct{})
+	var data []byte
+	go func() {
+		data, err = io.ReadAll(rc)
+		close(done)
+	}()
 
-	return content, nil
+	select {
+	case <-done:
+		return data, err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func initLogger()  {

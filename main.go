@@ -31,7 +31,7 @@ var (
 	ipfsGateways []string
 	gatewayLock  sync.Mutex
 	httpClient = &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: 1 * time.Minute,
 	}
 )
 
@@ -171,49 +171,51 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 		anyAvailable := false
 		matchWithIPFS := false
 
-		ipfsContent, err := fetchContentFromIPFS(cidStr, 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+		ipfsContent, err := fetchContentFromIPFS(ctx, cidStr)
 		if err != nil {
 			log.Printf("Failed to fetch content from IPFS for CID %s: %s", cidStr, err)
 			ipfsContent = nil
-		} else {
-			ipfsHash := hashData(ipfsContent)
+		} 
+		cancel()
 
-			for i, gateway := range gateways {
-				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-				// defer cancel()
+		ipfsHash := hashData(ipfsContent)
 
-				url := gateway + cidStr
-				status, err := sendReq(ctx, url)
+		for i, gateway := range gateways {
+			gatewayCtx, gatewayCancel := context.WithTimeout(context.Background(), 1*time.Minute)
+			// defer cancel()
+
+			url := gateway + cidStr
+			status, err := sendReqWithContext(gatewayCtx, url)
+			gatewayCancel()
+			if err != nil {
+				log.Printf("[XX] Failed to fetch %s: %s", url, err)
+				statuses[i] = "-"
+				matches[i] = "-"		
+				continue
+			}
+
+			if status == http.StatusOK {
+				log.Printf("[++] Content is available at %s", url)
+				statuses[i] = "+"
+				anyAvailable = true
+
+				resultsLock.Lock()
+				if _, err := fileActiveTxt.WriteString(url + "\n"); err != nil {
+					log.Printf("Failed to write active link to the text file: %s", err)
+				}
+				resultsLock.Unlock()
+
+				//fetching content from HTTP
+				httpContent, err := fetchContentFromHTTP(context.Background(), url)
 				if err != nil {
-					log.Printf("[XX] Failed to fetch %s: %s", url, err)
-					statuses[i] = "-"
+					log.Printf("Failed to fetch content from HTTP for URL %s: %s", url, err)
 					matches[i] = "-"
-					cancel()
 					continue
 				}
 
-				if status == http.StatusOK {
-					log.Printf("[++] Content is available at %s", url)
-					statuses[i] = "+"
-					anyAvailable = true
-
-					resultsLock.Lock()
-					if _, err := fileActiveTxt.WriteString(url + "\n"); err != nil {
-						log.Printf("Failed to write active link to the text file: %s", err)
-					}
-					resultsLock.Unlock()
-
-					//fetching content from HTTP
-					httpContent, err := fetchContentFromHTTP(ctx, url)
-					if err != nil {
-						log.Printf("Failed to fetch content from HTTP for URL %s: %s", url, err)
-						matches[i] = "-"
-						cancel()
-						continue
-					}
-
-					//Comparing hashes
-					// if ipfsContent != nil {
+				// Comparing hashes
+				if ipfsContent != nil {
 					httpHash := hashData(httpContent)
 					if ipfsHash == httpHash {
 						matches[i] = "+"
@@ -221,20 +223,18 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 					} else {
 						matches[i] = "-"
 					}
-					// } else {
-						// matches[i] = "-"
-					// }
-
-				} else if status == http.StatusGone || status == http.StatusUnavailableForLegalReasons {
-					log.Printf("[!!!] Content blocked at %s with status %d", url, status)
-					statuses[i] = "x"
-					matches[i] = "x"
 				} else {
-					log.Printf("[!!] Content not found at %s", url)
-					statuses[i] = "-"
 					matches[i] = "-"
 				}
-				cancel()
+
+			} else if status == http.StatusGone || status == http.StatusUnavailableForLegalReasons {
+				log.Printf("[!!!] Content blocked at %s with status %d", url, status)
+				statuses[i] = "x"
+				matches[i] = "x"
+			} else {
+				log.Printf("[!!] Content not found at %s", url)
+				statuses[i] = "-"
+				matches[i] = "-"
 			}
 		}
 		
@@ -270,7 +270,6 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 				csvWriter.Flush()
 			}()
 		}
-
 
 		if matchWithIPFS {
 			matchContentRow := append([]string{cidStr}, matches...)
@@ -416,8 +415,22 @@ func extractCID(link string) string {
 	return cidPart
 }
 
-func sendReq(ctx context.Context, url string) (int, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+// func sendReq(ctx context.Context, url string) (int, error) {
+// 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+// 	if err != nil {
+// 		return 0, err
+// 	}
+
+// 	resp, err := httpClient.Do(req)
+// 	if err != nil {
+// 		return 0, err
+// 	}
+// 	defer resp.Body.Close()
+// 	return resp.StatusCode, nil
+// }
+
+func sendReqWithContext(ctx context.Context, url string) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -427,6 +440,7 @@ func sendReq(ctx context.Context, url string) (int, error) {
 		return 0, err
 	}
 	defer resp.Body.Close()
+
 	return resp.StatusCode, nil
 }
 
@@ -454,7 +468,10 @@ func fetchContentFromHTTP(ctx context.Context, url string) ([]byte, error) {
 	return data, nil
 }
 
-// func fetchContentFromIPFS(cidStr string) ([]byte, error) {
+// func fetchContentFromIPFS(cidStr string, timeout time.Duration) ([]byte, error) {
+// 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+// 	defer cancel()
+
 // 	sh := shell.NewShell("localhost:5001")
 // 	rc, err := sh.Cat(cidStr)
 // 	if err != nil {
@@ -462,18 +479,22 @@ func fetchContentFromHTTP(ctx context.Context, url string) ([]byte, error) {
 // 	}
 // 	defer rc.Close()
 
-// 	content, err := io.ReadAll(rc)
-// 	if err != nil {
-// 		return nil, err
-// 	}
+// 	done := make(chan struct{})
+// 	var data []byte
+// 	go func() {
+// 		data, err = io.ReadAll(rc)
+// 		close(done)
+// 	}()
 
-// 	return content, nil
+// 	select {
+// 	case <-done:
+// 		return data, err
+// 	case <-ctx.Done():
+// 		return nil, ctx.Err()
+// 	}
 // }
 
-func fetchContentFromIPFS(cidStr string, timeout time.Duration) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
+func fetchContentFromIPFS(ctx context.Context, cidStr string) ([]byte, error) {
 	sh := shell.NewShell("localhost:5001")
 	rc, err := sh.Cat(cidStr)
 	if err != nil {

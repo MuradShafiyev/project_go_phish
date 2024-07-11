@@ -30,6 +30,9 @@ import (
 var (
 	ipfsGateways []string
 	gatewayLock  sync.Mutex
+	httpClient = &http.Client{
+		Timeout: 10 * time.Second,
+	}
 )
 
 func readGatewaysFromFile(filePath string) ([]string, error) {
@@ -75,10 +78,6 @@ func addNewGateway(newGateway string) {
 	if _, err := file.WriteString(newGateway + "\n"); err != nil {
 		log.Printf("Failed to write new gateway to file: %s", err)
 	}
-}
-
-var httpClient = &http.Client{
-	Timeout: 10 * time.Second,
 }
 
 func downloadFile(url string, filePathStr string) error {
@@ -176,61 +175,69 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 		if err != nil {
 			log.Printf("Failed to fetch content from IPFS for CID %s: %s", cidStr, err)
 			ipfsContent = nil
-		}
-		ipfsHash := hashData(ipfsContent)
+		} else {
+			ipfsHash := hashData(ipfsContent)
 
-		for i, gateway := range gateways {
-			url := gateway + cidStr
-			status, err := sendReq(url)
-			if err != nil {
-				log.Printf("[XX] Failed to fetch %s: %s", url, err)
-				statuses[i] = "-"
-				matches[i] = "-"
-				continue
-			}
+			for i, gateway := range gateways {
+				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+				// defer cancel()
 
-			if status == http.StatusOK {
-				log.Printf("[++] Content is available at %s", url)
-				statuses[i] = "+"
-				anyAvailable = true
-
-				resultsLock.Lock()
-				if _, err := fileActiveTxt.WriteString(url + "\n"); err != nil {
-					log.Printf("Failed to write active link to the text file: %s", err)
-				}
-				resultsLock.Unlock()
-
-				//fetching content from HTTP
-				httpContent, err := fetchContentFromHTTP(url)
+				url := gateway + cidStr
+				status, err := sendReq(ctx, url)
 				if err != nil {
-					log.Printf("Failed to fetch content from HTTP for URL %s: %s", url, err)
+					log.Printf("[XX] Failed to fetch %s: %s", url, err)
+					statuses[i] = "-"
 					matches[i] = "-"
+					cancel()
 					continue
 				}
 
-				//Comparing hashes
-				// if ipfsContent != nil {
-				httpHash := hashData(httpContent)
-				if ipfsHash == httpHash {
-					matches[i] = "+"
-					matchWithIPFS = true
+				if status == http.StatusOK {
+					log.Printf("[++] Content is available at %s", url)
+					statuses[i] = "+"
+					anyAvailable = true
+
+					resultsLock.Lock()
+					if _, err := fileActiveTxt.WriteString(url + "\n"); err != nil {
+						log.Printf("Failed to write active link to the text file: %s", err)
+					}
+					resultsLock.Unlock()
+
+					//fetching content from HTTP
+					httpContent, err := fetchContentFromHTTP(ctx, url)
+					if err != nil {
+						log.Printf("Failed to fetch content from HTTP for URL %s: %s", url, err)
+						matches[i] = "-"
+						cancel()
+						continue
+					}
+
+					//Comparing hashes
+					// if ipfsContent != nil {
+					httpHash := hashData(httpContent)
+					if ipfsHash == httpHash {
+						matches[i] = "+"
+						matchWithIPFS = true
+					} else {
+						matches[i] = "-"
+					}
+					// } else {
+						// matches[i] = "-"
+					// }
+
+				} else if status == http.StatusGone || status == http.StatusUnavailableForLegalReasons {
+					log.Printf("[!!!] Content blocked at %s with status %d", url, status)
+					statuses[i] = "x"
+					matches[i] = "x"
 				} else {
+					log.Printf("[!!] Content not found at %s", url)
+					statuses[i] = "-"
 					matches[i] = "-"
 				}
-				// } else {
-					// matches[i] = "-"
-				// }
-
-			} else if status == http.StatusGone || status == http.StatusUnavailableForLegalReasons {
-				log.Printf("[!!!] Content blocked at %s with status %d", url, status)
-				statuses[i] = "x"
-				matches[i] = "x"
-			} else {
-				log.Printf("[!!] Content not found at %s", url)
-				statuses[i] = "-"
-				matches[i] = "-"
+				cancel()
 			}
 		}
+		
 
 		//Checking for additional/new gateways in the found IPFS links and adding to the IPFS gateways list
 		if strings.HasPrefix(link, "http://") || strings.HasPrefix(link, "https://") {
@@ -339,7 +346,7 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 	var resultsLock sync.Mutex
 
 	//Launching goroutines to send requests
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 5; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -356,8 +363,11 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		log.Printf("Error scanning file: %s", err)
+		log.Printf("Error scanning found-ipfs-phishing-links.txt: %s", err)
 	}
+
+	close(linkChannel)
+	wg.Wait()
 
 	// Read CIDs from the 'phishing_cids.csv' file and send them to the channel
 	phishingCIDsFile, err := os.Open(phishingCIDsFilePath)
@@ -365,8 +375,18 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 		log.Fatalf("Failed to open phishing CIDs file: %s", err)
 	}
 	defer phishingCIDsFile.Close()
-
 	phishingCIDsScanner := bufio.NewScanner(phishingCIDsFile)
+
+	//Launching another goroutines
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			processCIDs(linkChannel, gateways, csvWriter, matchContentWriter, fileActiveTxt, &resultsLock, processedCIDs)
+		}()
+	}
+
+	
 	for phishingCIDsScanner.Scan() {
 		cid := phishingCIDsScanner.Text()
 		linkChannel <- cid
@@ -396,8 +416,13 @@ func extractCID(link string) string {
 	return cidPart
 }
 
-func sendReq(url string) (int, error) {
-	resp, err := httpClient.Get(url)
+func sendReq(ctx context.Context, url string) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -405,8 +430,13 @@ func sendReq(url string) (int, error) {
 	return resp.StatusCode, nil
 }
 
-func fetchContentFromHTTP(url string) ([]byte, error) {
-	resp, err := httpClient.Get(url)
+func fetchContentFromHTTP(ctx context.Context, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -742,7 +772,7 @@ func main() {
 		if _, err := os.Stat(filePathActiveIPFSLinks); os.IsNotExist(err) {
 			break
 		}
-		counter++	
+		counter++	 
 	}
 
 	var err error

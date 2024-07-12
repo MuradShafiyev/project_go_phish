@@ -552,9 +552,9 @@ func restartIPFSDaemon() error {
 		stopCmd = exec.Command("taskkill", "/F", "/IM", "ipfs.exe")
 		startCmd = exec.Command("cmd", "/C", "start", "ipfs", "daemon")
 	} else {
-		// For Linux, use pkill to stop the process and ipfs daemon to start it
+		// For Linux, use pkill to stop the process and ipfs daemon to start it in the background
 		stopCmd = exec.Command("pkill", "-f", "ipfs daemon")
-		startCmd = exec.Command("ipfs", "daemon")
+		startCmd = exec.Command("nohup", "ipfs", "daemon", "&")
 	}
 
 	// Stop the IPFS daemon
@@ -562,7 +562,7 @@ func restartIPFSDaemon() error {
 		return fmt.Errorf("failed to stop IPFS daemon: %v", err)
 	}
 
-	// Start the IPFS daemon
+	// Start the IPFS daemon in the background
 	if err := startCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start IPFS daemon: %v", err)
 	}

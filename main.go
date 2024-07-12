@@ -2,9 +2,9 @@ package main
 
 import (
 	"bufio"
+	"os/exec"
 	"crypto/sha256"
 	"encoding/csv"
-	"context"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -18,9 +18,10 @@ import (
 	"strings"
 	"sync"
 	"time"
-	
-	shell "github.com/ipfs/go-ipfs-api"
+	"runtime"
+
 	"github.com/ipfs/go-cid"
+	shell "github.com/ipfs/go-ipfs-api"
 )
 
 // date: 09.06.2024
@@ -154,9 +155,14 @@ func hashData(data []byte) string {
 	return hex.EncodeToString(hash[:])
 }
 
-func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchContentWriter *csv.Writer, fileActiveTxt *os.File, resultsLock *sync.Mutex, processedCIDs map[string]bool) {
+func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchContentWriter *csv.Writer, fileActiveTxt *os.File, resultsLock *sync.Mutex, processedCIDs map[string]bool, extractFromURL bool) {
 	for link := range linkChannel {
-		cidStr := extractCID(link)
+		var cidStr string
+		if extractFromURL {
+			cidStr = extractCID(link)
+		} else {
+			cidStr = link
+		}
 
 		resultsLock.Lock()
 		if processedCIDs[cidStr] {
@@ -171,27 +177,39 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 		anyAvailable := false
 		matchWithIPFS := false
 
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-		ipfsContent, err := fetchContentFromIPFS(ctx, cidStr)
+		// ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+		
+		var ipfsContent []byte
+		var err error
+		for {
+			ipfsContent, err = fetchContentFromIPFSWithTimeout(cidStr, 1*time.Minute)
+			if err != nil && strings.Contains(err.Error(), "timeout") {
+				log.Println("[I] IPFS request timed out. Restarting IPFS daemon...")
+				if err := restartIPFSDaemon(); err != nil {
+					log.Fatalf("[I] Failed to restart IPFS daemon: %s", err)
+				}
+				continue
+			}
+			break
+		}
+		
+		
 		if err != nil {
 			log.Printf("Failed to fetch content from IPFS for CID %s: %s", cidStr, err)
 			ipfsContent = nil
-		} 
-		cancel()
-
+		}
 		ipfsHash := hashData(ipfsContent)
 
 		for i, gateway := range gateways {
-			gatewayCtx, gatewayCancel := context.WithTimeout(context.Background(), 1*time.Minute)
-			// defer cancel()
-
+			// gatewayCtx, gatewayCancel := context.WithTimeout(context.Background(), 1*time.Minute)
 			url := gateway + cidStr
-			status, err := sendReqWithContext(gatewayCtx, url)
-			gatewayCancel()
+			// status, err := sendReqWithContext(gatewayCtx, url)
+			status, err := sendReq(url)
+			// gatewayCancel()
 			if err != nil {
 				log.Printf("[XX] Failed to fetch %s: %s", url, err)
 				statuses[i] = "-"
-				matches[i] = "-"		
+				matches[i] = "-"
 				continue
 			}
 
@@ -207,25 +225,25 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 				resultsLock.Unlock()
 
 				//fetching content from HTTP
-				httpContent, err := fetchContentFromHTTP(context.Background(), url)
+				httpContent, err := fetchContentFromHTTP(url)
 				if err != nil {
 					log.Printf("Failed to fetch content from HTTP for URL %s: %s", url, err)
 					matches[i] = "-"
 					continue
 				}
 
-				// Comparing hashes
-				if ipfsContent != nil {
-					httpHash := hashData(httpContent)
-					if ipfsHash == httpHash {
-						matches[i] = "+"
-						matchWithIPFS = true
-					} else {
-						matches[i] = "-"
-					}
+				//Comparing hashes
+				// if ipfsContent != nil {
+				httpHash := hashData(httpContent)
+				if ipfsHash == httpHash {
+					matches[i] = "+"
+					matchWithIPFS = true
 				} else {
 					matches[i] = "-"
 				}
+				// } else {
+					// matches[i] = "-"
+				// }
 
 			} else if status == http.StatusGone || status == http.StatusUnavailableForLegalReasons {
 				log.Printf("[!!!] Content blocked at %s with status %d", url, status)
@@ -237,7 +255,6 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 				matches[i] = "-"
 			}
 		}
-		
 
 		//Checking for additional/new gateways in the found IPFS links and adding to the IPFS gateways list
 		if strings.HasPrefix(link, "http://") || strings.HasPrefix(link, "https://") {
@@ -271,6 +288,7 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 			}()
 		}
 
+
 		if matchWithIPFS {
 			matchContentRow := append([]string{cidStr}, matches...)
 			func() {
@@ -286,12 +304,6 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 }
 
 func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string, filePathActiveTxt string, phishingCIDsFilePath string) {
-	file, err := os.Open(filePathStr)
-	if err != nil {
-		log.Fatalf("Failed to open file: %s", err)
-	}
-	defer file.Close()
-
 	fileActiveTxt, err := os.Create(filePathActiveTxt)
 	if err != nil {
 		log.Fatalf("Failed to create text file: %s", err)
@@ -335,67 +347,90 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 		log.Fatalf("Failed to write match content CSV header: %s", err)
 	}
 
-	ipfsRegex := regexp.MustCompile(`(ipfs://\S+|https?://[^\s]+/ipfs/[a-zA-Z0-9]+[^\s]*)`)
-	scanner := bufio.NewScanner(file)
+	
+	// scanner := bufio.NewScanner(file)
 
 	var wg sync.WaitGroup
-	linkChannel := make(chan string)
-
 	processedCIDs := make(map[string]bool)
 	var resultsLock sync.Mutex
 
-	//Launching goroutines to send requests
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			processCIDs(linkChannel, gateways, csvWriter, matchContentWriter, fileActiveTxt, &resultsLock, processedCIDs)
-		}()
-	}
+	// linkChannel = make(chan string)
 
-	//reading links and send to channel
-	for scanner.Scan() {
-		line := scanner.Text()
-		matches := ipfsRegex.FindAllString(line, -1)
-		for _, match := range matches {
-			linkChannel <- match
+	processPhishingCIDs := func() {
+		defer wg.Done()
+
+		// Read CIDs from the 'phishing_cids.csv' file and send them to the channel
+		phishingCIDsFile, err := os.Open(phishingCIDsFilePath)
+		if err != nil {
+			log.Fatalf("Failed to open phishing CIDs file: %s", err)
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		log.Printf("Error scanning found-ipfs-phishing-links.txt: %s", err)
+		defer phishingCIDsFile.Close()
+		phishingCIDsScanner := bufio.NewScanner(phishingCIDsFile)
+		linkChannel := make(chan string)
+
+		//Launching another goroutines
+		for i := 0; i < 5; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				processCIDs(linkChannel, gateways, csvWriter, matchContentWriter, fileActiveTxt, &resultsLock, processedCIDs, false)
+			}()
+		}
+
+		for phishingCIDsScanner.Scan() {
+			cid := phishingCIDsScanner.Text()
+			linkChannel <- cid
+		}
+		if err := phishingCIDsScanner.Err(); err != nil {
+			log.Printf("Error scanning phishing CIDs file: %s", err)
+		}
+
+		close(linkChannel)
 	}
 
-	close(linkChannel)
-	wg.Wait()
+	processFoundIPFSLinks := func() {
+		defer wg.Done()
 
-	// Read CIDs from the 'phishing_cids.csv' file and send them to the channel
-	phishingCIDsFile, err := os.Open(phishingCIDsFilePath)
-	if err != nil {
-		log.Fatalf("Failed to open phishing CIDs file: %s", err)
+		file, err := os.Open(filePathStr)
+		if err != nil {
+			log.Fatalf("Failed to open file: %s", err)
+		}
+		defer file.Close()
+		scanner := bufio.NewScanner(file)
+		linkChannel := make(chan string)
+
+		//Launching goroutines to process CIDs from 'found-ipfs-phishing-links.txt'
+		for i := 0; i< 5; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				processCIDs(linkChannel, gateways, csvWriter, matchContentWriter, fileActiveTxt, &resultsLock, processedCIDs, true)
+			}()
+		}
+
+		// reading links and send to channel
+		for scanner.Scan() {
+			line := scanner.Text()
+			ipfsRegex := regexp.MustCompile(`(ipfs://\S+|https?://[^\s]+/ipfs/[a-zA-Z0-9]+[^\s]*)`)
+			matches := ipfsRegex.FindAllString(line, -1)
+			for _, match := range matches {
+				linkChannel <- match
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			log.Printf("Error scanning found-ipfs-phishing-links.txt: %s", err)
+		}
+
+		close(linkChannel)
 	}
-	defer phishingCIDsFile.Close()
-	phishingCIDsScanner := bufio.NewScanner(phishingCIDsFile)
-
-	//Launching another goroutines
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			processCIDs(linkChannel, gateways, csvWriter, matchContentWriter, fileActiveTxt, &resultsLock, processedCIDs)
-		}()
-	}
-
 	
-	for phishingCIDsScanner.Scan() {
-		cid := phishingCIDsScanner.Text()
-		linkChannel <- cid
-	}
-	if err := phishingCIDsScanner.Err(); err != nil {
-		log.Printf("Error scanning phishing CIDs file: %s", err)
-	}
+	wg.Add(1)
+	go processPhishingCIDs()
 
-
-	close(linkChannel)
+	wg.Wait()
+	
+	wg.Add(1)
+	go processFoundIPFSLinks()
 	wg.Wait()
 }
 
@@ -415,42 +450,17 @@ func extractCID(link string) string {
 	return cidPart
 }
 
-// func sendReq(ctx context.Context, url string) (int, error) {
-// 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-// 	if err != nil {
-// 		return 0, err
-// 	}
-
-// 	resp, err := httpClient.Do(req)
-// 	if err != nil {
-// 		return 0, err
-// 	}
-// 	defer resp.Body.Close()
-// 	return resp.StatusCode, nil
-// }
-
-func sendReqWithContext(ctx context.Context, url string) (int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return 0, err
-	}
-
-	resp, err := httpClient.Do(req)
+func sendReq(url string) (int, error) {
+	resp, err := httpClient.Get(url)
 	if err != nil {
 		return 0, err
 	}
 	defer resp.Body.Close()
-
 	return resp.StatusCode, nil
 }
 
-func fetchContentFromHTTP(ctx context.Context, url string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	
-	resp, err := httpClient.Do(req)
+func fetchContentFromHTTP(url string) ([]byte, error) {
+	resp, err := httpClient.Get(url)
 	if err != nil {
 		return nil, err
 	}
@@ -468,33 +478,7 @@ func fetchContentFromHTTP(ctx context.Context, url string) ([]byte, error) {
 	return data, nil
 }
 
-// func fetchContentFromIPFS(cidStr string, timeout time.Duration) ([]byte, error) {
-// 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-// 	defer cancel()
-
-// 	sh := shell.NewShell("localhost:5001")
-// 	rc, err := sh.Cat(cidStr)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	defer rc.Close()
-
-// 	done := make(chan struct{})
-// 	var data []byte
-// 	go func() {
-// 		data, err = io.ReadAll(rc)
-// 		close(done)
-// 	}()
-
-// 	select {
-// 	case <-done:
-// 		return data, err
-// 	case <-ctx.Done():
-// 		return nil, ctx.Err()
-// 	}
-// }
-
-func fetchContentFromIPFS(ctx context.Context, cidStr string) ([]byte, error) {
+func fetchContentFromIPFSWithTimeout(cidStr string, timeout time.Duration) ([]byte, error) {
 	sh := shell.NewShell("localhost:5001")
 	rc, err := sh.Cat(cidStr)
 	if err != nil {
@@ -503,17 +487,18 @@ func fetchContentFromIPFS(ctx context.Context, cidStr string) ([]byte, error) {
 	defer rc.Close()
 
 	done := make(chan struct{})
-	var data []byte
+	var content []byte
+	var readErr error
 	go func() {
-		data, err = io.ReadAll(rc)
+		content, readErr = io.ReadAll(rc)
 		close(done)
 	}()
 
 	select {
 	case <-done:
-		return data, err
-	case <-ctx.Done():
-		return nil, ctx.Err()
+		return content, readErr
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("timeout fetching content from IPFS for CID %s", cidStr)
 	}
 }
 
@@ -553,6 +538,39 @@ func checkIPFSDaemon() bool {
 	}
 	log.Println("IPFS daemon is running.")
 	return true
+}
+
+func restartIPFSDaemon() error {
+	log.Println("Restarting IPFS daemon...")
+
+	var stopCmd *exec.Cmd
+	var startCmd *exec.Cmd
+
+	// Check the operating system and set the commands accordingly
+	if runtime.GOOS == "windows" {
+		// For Windows, use taskkill to stop the process and ipfs daemon to start it
+		stopCmd = exec.Command("taskkill", "/F", "/IM", "ipfs.exe")
+		startCmd = exec.Command("cmd", "/C", "start", "ipfs", "daemon")
+	} else {
+		// For Linux, use pkill to stop the process and ipfs daemon to start it
+		stopCmd = exec.Command("pkill", "-f", "ipfs daemon")
+		startCmd = exec.Command("ipfs", "daemon")
+	}
+
+	// Stop the IPFS daemon
+	if err := stopCmd.Run(); err != nil {
+		return fmt.Errorf("failed to stop IPFS daemon: %v", err)
+	}
+
+	// Start the IPFS daemon
+	if err := startCmd.Start(); err != nil {
+		return fmt.Errorf("failed to start IPFS daemon: %v", err)
+	}
+
+	log.Println("IPFS daemon restarted successfully.")
+	// Give some time for the daemon to start
+	time.Sleep(10 * time.Second)
+	return nil
 }
 
 const denyListURL = "https://badbits.dwebops.pub/badbits.deny"

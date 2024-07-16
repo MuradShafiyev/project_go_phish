@@ -609,11 +609,13 @@ func isIPFSDaemonRunning() (bool, error) {
 
 func continuouslyRestartIPFSDaemon() {
 	for {
+		time.Sleep(1 * time.Minute)
 		log.Println("[I] Restarting IPFS daemon...")
 		if err := restartIPFSDaemon(); err != nil {
 			log.Printf("[I] Failed to restart IPFS daemon: %s", err)
+		} else {
+			log.Println("IPFS daemon restarted successfully.")
 		}
-		time.Sleep(1 * time.Minute)
 	}
 }
 
@@ -832,8 +834,14 @@ func main() {
 
 	if !checkIPFSDaemon() {
 		log.Println("IPFS daemon is not running. Restarting...")
-		if err := restartIPFSDaemon(); err != nil {
-			log.Fatalf("Failed to restart IPFS daemon: %s", err)
+		for {
+			if err := restartIPFSDaemon(); err != nil {
+				log.Printf("Failed to restart IPFS daemon: %s", err)
+				time.Sleep(5 * time.Second) // Wait before retrying
+			} else {
+				log.Println("IPFS daemon restarted successfully.")
+				break
+			}
 		}
 	}
 

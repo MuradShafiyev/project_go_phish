@@ -186,9 +186,7 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 			ipfsContent, err = fetchContentFromIPFSWithTimeout(cidStr, 1*time.Minute)
 			if err != nil && (strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "context deadline exceeded") || strings.Contains(err.Error(), "EOF")) {
 				log.Println("[I] IPFS request timed out. Restarting IPFS daemon...")
-				if err := restartIPFSDaemon(); err != nil {
-					log.Fatalf("[I] Failed to restart IPFS daemon: %s", err)
-				}
+				time.Sleep(1 * time.Minute)
 				continue
 			}
 			break
@@ -198,6 +196,9 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 			log.Printf("Failed to fetch content from IPFS for CID %s: %s", cidStr, err)
 			ipfsContent = nil
 		}
+
+		go continuouslyRestartIPFSDaemon()
+
 		ipfsHash := hashData(ipfsContent)
 
 		for i, gateway := range gateways {
@@ -597,12 +598,22 @@ func isIPFSDaemonRunning() (bool, error) {
 		checkCmd = exec.Command("pgrep", "-f", "ipfs daemon")
 	}
 
-	output, err := checkCmd.Output()
+	output, err := checkCmd.CombinedOutput()
 	if err != nil {
 		return false, fmt.Errorf("failed to check IPFS daemon process: %v", err)
 	}
 
 	return strings.TrimSpace(string(output)) != "", nil
+}
+
+func continuouslyRestartIPFSDaemon() {
+	for {
+		log.Println("[I] Restarting IPFS daemon...")
+		if err := restartIPFSDaemon(); err != nil {
+			log.Printf("[I] Failed to restart IPFS daemon: %s", err)
+		}
+		time.Sleep(1 * time.Minute)
+	}
 }
 
 const denyListURL = "https://badbits.dwebops.pub/badbits.deny"

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"os/exec"
+	"context"
 	"crypto/sha256"
 	"encoding/csv"
 	"encoding/hex"
@@ -183,7 +184,7 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 		var err error
 		for {
 			ipfsContent, err = fetchContentFromIPFSWithTimeout(cidStr, 1*time.Minute)
-			if err != nil && strings.Contains(err.Error(), "timeout") {
+			if err != nil && (strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "context deadline exceeded") || strings.Contains(err.Error(), "EOF")) {
 				log.Println("[I] IPFS request timed out. Restarting IPFS daemon...")
 				if err := restartIPFSDaemon(); err != nil {
 					log.Fatalf("[I] Failed to restart IPFS daemon: %s", err)
@@ -192,7 +193,6 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 			}
 			break
 		}
-		
 		
 		if err != nil {
 			log.Printf("Failed to fetch content from IPFS for CID %s: %s", cidStr, err)
@@ -479,6 +479,9 @@ func fetchContentFromHTTP(url string) ([]byte, error) {
 }
 
 func fetchContentFromIPFSWithTimeout(cidStr string, timeout time.Duration) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	sh := shell.NewShell("localhost:5001")
 	rc, err := sh.Cat(cidStr)
 	if err != nil {
@@ -487,18 +490,17 @@ func fetchContentFromIPFSWithTimeout(cidStr string, timeout time.Duration) ([]by
 	defer rc.Close()
 
 	done := make(chan struct{})
-	var content []byte
-	var readErr error
+	var data []byte
 	go func() {
-		content, readErr = io.ReadAll(rc)
+		data, err = io.ReadAll(rc)
 		close(done)
 	}()
 
 	select {
 	case <-done:
-		return content, readErr
-	case <-time.After(timeout):
-		return nil, fmt.Errorf("timeout fetching content from IPFS for CID %s", cidStr)
+		return data, err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
@@ -543,23 +545,36 @@ func checkIPFSDaemon() bool {
 func restartIPFSDaemon() error {
 	log.Println("Restarting IPFS daemon...")
 
-	var stopCmd *exec.Cmd
-	var startCmd *exec.Cmd
-
-	// Check the operating system and set the commands accordingly
-	if runtime.GOOS == "windows" {
-		// For Windows, use taskkill to stop the process and ipfs daemon to start it
-		stopCmd = exec.Command("taskkill", "/F", "/IM", "ipfs.exe")
-		startCmd = exec.Command("cmd", "/C", "start", "ipfs", "daemon")
-	} else {
-		// For Linux, use pkill to stop the process and ipfs daemon to start it in the background
-		stopCmd = exec.Command("pkill", "-f", "ipfs daemon")
-		startCmd = exec.Command("nohup", "ipfs", "daemon", "&")
+	// Check if the IPFS daemon is running before attempting to stop it
+	isRunning, err := isIPFSDaemonRunning()
+	if err != nil {
+		return fmt.Errorf("failed to check IPFS daemon status: %v", err)
 	}
 
-	// Stop the IPFS daemon
-	if err := stopCmd.Run(); err != nil {
-		return fmt.Errorf("failed to stop IPFS daemon: %v", err)
+	if isRunning {
+		var stopCmd *exec.Cmd
+
+		// Check the operating system and set the commands accordingly
+		if runtime.GOOS == "windows" {
+			// For Windows, use taskkill to stop the process
+			stopCmd = exec.Command("taskkill", "/F", "/IM", "ipfs.exe")
+		} else {
+			// For Linux, use pkill to stop the process
+			stopCmd = exec.Command("pkill", "-f", "ipfs daemon")
+		}
+
+		// Stop the IPFS daemon
+		if err := stopCmd.Run(); err != nil {
+			log.Printf("Failed to stop IPFS daemon (it might not be running): %v", err)
+		}
+	}
+
+	// Start the IPFS daemon
+	var startCmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		startCmd = exec.Command("cmd", "/C", "start", "ipfs", "daemon")
+	} else {
+		startCmd = exec.Command("nohup", "ipfs", "daemon", "&")
 	}
 
 	// Start the IPFS daemon in the background
@@ -571,6 +586,23 @@ func restartIPFSDaemon() error {
 	// Give some time for the daemon to start
 	time.Sleep(10 * time.Second)
 	return nil
+}
+
+func isIPFSDaemonRunning() (bool, error) {
+	var checkCmd *exec.Cmd
+
+	if runtime.GOOS == "windows" {
+		checkCmd = exec.Command("tasklist", "/FI", "IMAGENAME eq ipfs.exe")
+	} else {
+		checkCmd = exec.Command("pgrep", "-f", "ipfs daemon")
+	}
+
+	output, err := checkCmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("failed to check IPFS daemon process: %v", err)
+	}
+
+	return strings.TrimSpace(string(output)) != "", nil
 }
 
 const denyListURL = "https://badbits.dwebops.pub/badbits.deny"
@@ -785,7 +817,10 @@ func main() {
 	flag.Parse()
 
 	if !checkIPFSDaemon() {
-		log.Fatalf("IPFS daemon is not running. Please start the IPFS daemon and try again.")
+		log.Println("IPFS daemon is not running. Restarting...")
+		if err := restartIPFSDaemon(); err != nil {
+			log.Fatalf("Failed to restart IPFS daemon: %s", err)
+		}
 	}
 
 	fileURL := "https://raw.githubusercontent.com/mitchellkrogza/Phishing.Database/master/ALL-phishing-links.txt"

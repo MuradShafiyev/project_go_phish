@@ -197,8 +197,6 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 			ipfsContent = nil
 		}
 
-		go continuouslyRestartIPFSDaemon()
-
 		ipfsHash := hashData(ipfsContent)
 
 		for i, gateway := range gateways {
@@ -546,31 +544,26 @@ func checkIPFSDaemon() bool {
 func restartIPFSDaemon() error {
 	log.Println("Restarting IPFS daemon...")
 
-	// Check if the IPFS daemon is running before attempting to stop it
 	isRunning, err := isIPFSDaemonRunning()
 	if err != nil {
-		return fmt.Errorf("failed to check IPFS daemon status: %v", err)
+		log.Printf("Failed to check IPFS daemon status: %v", err)
+		isRunning = false
 	}
 
 	if isRunning {
 		var stopCmd *exec.Cmd
 
-		// Check the operating system and set the commands accordingly
 		if runtime.GOOS == "windows" {
-			// For Windows, use taskkill to stop the process
 			stopCmd = exec.Command("taskkill", "/F", "/IM", "ipfs.exe")
 		} else {
-			// For Linux, use pkill to stop the process
 			stopCmd = exec.Command("pkill", "-f", "ipfs daemon")
 		}
 
-		// Stop the IPFS daemon
 		if err := stopCmd.Run(); err != nil {
 			log.Printf("Failed to stop IPFS daemon (it might not be running): %v", err)
 		}
 	}
 
-	// Start the IPFS daemon
 	var startCmd *exec.Cmd
 	if runtime.GOOS == "windows" {
 		startCmd = exec.Command("cmd", "/C", "start", "ipfs", "daemon")
@@ -578,15 +571,23 @@ func restartIPFSDaemon() error {
 		startCmd = exec.Command("nohup", "ipfs", "daemon", "&")
 	}
 
-	// Start the IPFS daemon in the background
 	if err := startCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start IPFS daemon: %v", err)
 	}
 
 	log.Println("IPFS daemon restarted successfully.")
-	// Give some time for the daemon to start
 	time.Sleep(10 * time.Second)
-	return nil
+
+	// Verify if the IPFS daemon has started correctly
+	retries := 3
+	for i := 0; i < retries; i++ {
+		if checkIPFSDaemon() {
+			log.Println("IPFS daemon is running.")
+			return nil
+		}
+		time.Sleep(5 * time.Second)
+	}
+	return fmt.Errorf("IPFS daemon failed to start after %d retries", retries)
 }
 
 func isIPFSDaemonRunning() (bool, error) {
@@ -822,6 +823,8 @@ func checkBadBits() {
 
 func main() {
 	initLogger()
+
+	go continuouslyRestartIPFSDaemon()
 
 	var extract bool
 	flag.BoolVar(&extract, "e", false, "extract results live in CSV format")

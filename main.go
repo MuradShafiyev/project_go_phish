@@ -3,10 +3,12 @@ package main
 import (
 	"bufio"
 	"os/exec"
+	// "bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/csv"
 	"encoding/hex"
+	// "encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -35,6 +37,7 @@ var (
 	httpClient = &http.Client{
 		Timeout: 1 * time.Minute,
 	}
+	apiToken string
 )
 
 func readGatewaysFromFile(filePath string) ([]string, error) {
@@ -156,7 +159,14 @@ func hashData(data []byte) string {
 	return hex.EncodeToString(hash[:])
 }
 
-func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchContentWriter *csv.Writer, fileActiveTxt *os.File, resultsLock *sync.Mutex, processedCIDs map[string]bool, extractFromURL bool) {
+func getStatusMessage(err error) string {
+	if err == nil {
+		return "Success"
+	}
+	return err.Error()
+}
+
+func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchContentWriter *csv.Writer, responseWriter *csv.Writer, fileActiveTxt *os.File, resultsLock *sync.Mutex, processedCIDs map[string]bool, extractFromURL bool) {
 	for link := range linkChannel {
 		var cidStr string
 		if extractFromURL {
@@ -183,10 +193,19 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 		var ipfsContent []byte
 		var err error
 		for {
+			if !checkIPFSDaemon() {
+				log.Println("[I] IPFS daemon is not running. Restarting...")
+				if err:= restartIPFSDaemon(); err !=nil {
+					log.Fatalf("[I] Failed to restart IPFS daemon: %s", err)
+				}
+			}
+
 			ipfsContent, err = fetchContentFromIPFSWithTimeout(cidStr, 1*time.Minute)
 			if err != nil && (strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "context deadline exceeded") || strings.Contains(err.Error(), "EOF")) {
 				log.Println("[I] IPFS request timed out. Restarting IPFS daemon...")
-				time.Sleep(1 * time.Minute)
+				if err := restartIPFSDaemon(); err != nil {
+					log.Fatalf("[I] Failed to restart IPFS daemon: %s", err)
+				}
 				continue
 			}
 			break
@@ -199,16 +218,20 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 
 		ipfsHash := hashData(ipfsContent)
 
+		responseStatuses := []string{cidStr, "IPFS response: " + getStatusMessage(err)}
+
 		for i, gateway := range gateways {
 			// gatewayCtx, gatewayCancel := context.WithTimeout(context.Background(), 1*time.Minute)
 			url := gateway + cidStr
 			// status, err := sendReqWithContext(gatewayCtx, url)
 			status, err := sendReq(url)
+			responseStatus := getStatusMessage(err)
 			// gatewayCancel()
 			if err != nil {
 				log.Printf("[XX] Failed to fetch %s: %s", url, err)
 				statuses[i] = "-"
 				matches[i] = "-"
+				responseStatuses = append(responseStatuses, responseStatus)
 				continue
 			}
 
@@ -228,6 +251,7 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 				if err != nil {
 					log.Printf("Failed to fetch content from HTTP for URL %s: %s", url, err)
 					matches[i] = "-"
+					responseStatuses = append(responseStatuses, "HTTP Response: " + getStatusMessage(err))
 					continue
 				}
 
@@ -248,10 +272,12 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 				log.Printf("[!!!] Content blocked at %s with status %d", url, status)
 				statuses[i] = "x"
 				matches[i] = "x"
+				responseStatuses = append(responseStatuses, "Blocked (HTTP STATUS 410 or 451)")
 			} else {
 				log.Printf("[!!] Content not found at %s", url)
 				statuses[i] = "-"
 				matches[i] = "-"
+				responseStatuses = append(responseStatuses, "Not Found")
 			}
 		}
 
@@ -299,6 +325,16 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 				matchContentWriter.Flush()
 			}()
 		}
+
+		// writing response statuses to CSV
+		func()  {
+			resultsLock.Lock()
+			defer resultsLock.Unlock()
+			if err := responseWriter.Write(responseStatuses); err != nil {
+				log.Printf("Failed to write row to the response CSV file: %s", err)
+			}
+			responseWriter.Flush()
+		}()
 	}
 }
 
@@ -319,12 +355,16 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 
 	date := time.Now().Format("20060102")
 	counter := 1
-	var filePathMatchContent string
+	var filePathMatchContent, filePathResponses string
 	for {
 		filePathMatchContent = fmt.Sprintf("./collected_data/%s_matchcontent_%d.csv", date, counter)
+		filePathResponses = fmt.Sprintf("./collected_data/%s_responses_%d.csv", date, counter)
 		if _, err := os.Stat(filePathMatchContent); os.IsNotExist(err) {
 			break
 		}
+		// if _, err := os.Stat(filePathResponses); os.IsNotExist(err) {
+		// 	break
+		// }
 		counter++
 	}
 
@@ -336,6 +376,14 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 	matchContentWriter := csv.NewWriter(fileMatchContent)
 	defer matchContentWriter.Flush()
 
+	fileResponses, err := os.Create(filePathResponses)
+	if err != nil {
+		log.Fatalf("Failed to create responses CSV file: %s", err)
+	}
+	defer fileResponses.Close()
+	responseWriter := csv.NewWriter(fileResponses)
+	defer responseWriter.Flush()
+
 	// Writes CSV headers
 	header := append([]string{"CID", "accessibleOnIPFS"}, gateways...)
 	if err := csvWriter.Write(header); err != nil {
@@ -344,6 +392,10 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 	matchContentHeader := append([]string{"CID"}, gateways...)
 	if err := matchContentWriter.Write(matchContentHeader); err != nil {
 		log.Fatalf("Failed to write match content CSV header: %s", err)
+	}
+	responseHeader := append([]string{"CID", "IPFS Response"}, gateways...)
+	if err:= responseWriter.Write(responseHeader); err != nil {
+		log.Fatalf("Failed to write responses CSV header: %s", err)
 	}
 
 	
@@ -368,11 +420,11 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 		linkChannel := make(chan string)
 
 		//Launching another goroutines
-		for i := 0; i < 5; i++ {
+		for i := 0; i < 3; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				processCIDs(linkChannel, gateways, csvWriter, matchContentWriter, fileActiveTxt, &resultsLock, processedCIDs, false)
+				processCIDs(linkChannel, gateways, csvWriter, matchContentWriter, responseWriter, fileActiveTxt, &resultsLock, processedCIDs, false)
 			}()
 		}
 
@@ -399,11 +451,11 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 		linkChannel := make(chan string)
 
 		//Launching goroutines to process CIDs from 'found-ipfs-phishing-links.txt'
-		for i := 0; i< 5; i++ {
+		for i := 0; i< 3; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				processCIDs(linkChannel, gateways, csvWriter, matchContentWriter, fileActiveTxt, &resultsLock, processedCIDs, true)
+				processCIDs(linkChannel, gateways, csvWriter, matchContentWriter, responseWriter, fileActiveTxt, &resultsLock, processedCIDs, true)
 			}()
 		}
 
@@ -566,7 +618,8 @@ func restartIPFSDaemon() error {
 
 	var startCmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		startCmd = exec.Command("cmd", "/C", "start", "ipfs", "daemon")
+		// startCmd = exec.Command("cmd", "/C", "start", "ipfs", "daemon")
+		startCmd = exec.Command("cmd", "/C", "start", "/b", "ipfs", "daemon")
 	} else {
 		startCmd = exec.Command("nohup", "ipfs", "daemon", "&")
 	}
@@ -607,243 +660,48 @@ func isIPFSDaemonRunning() (bool, error) {
 	return strings.TrimSpace(string(output)) != "", nil
 }
 
-func continuouslyRestartIPFSDaemon() {
-	for {
-		time.Sleep(1 * time.Minute)
-		log.Println("[I] Restarting IPFS daemon...")
-		if err := restartIPFSDaemon(); err != nil {
-			log.Printf("[I] Failed to restart IPFS daemon: %s", err)
-		} else {
-			log.Println("IPFS daemon restarted successfully.")
-		}
-	}
-}
-
-// const denyListURL = "https://badbits.dwebops.pub/badbits.deny"
-
-// func downloadBadBitsList(url string, filePath string) error {
-// 	resp, err := http.Get(url)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	defer resp.Body.Close()
-
-// 	if resp.StatusCode != http.StatusOK {
-// 		return fmt.Errorf("bad status: %s", resp.Status)
-// 	}
-
-// 	out, err := os.Create(filePath)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	defer out.Close()
-
-// 	_, err = io.Copy(out, resp.Body)
-// 	if err != nil {
-// 		return err
-// 	}
-
-// 	return nil
-// }
-
-// func fetchAndParseDenyList(filePath string) (map[string]bool, error) {
-// 	file, err := os.Open(filePath)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	defer file.Close()
-
-// 	denyList := make(map[string]bool)
-// 	scanner := bufio.NewScanner(file)
-// 	for scanner.Scan() {
-// 		line := scanner.Text()
-// 		if strings.HasPrefix(line, "//") {
-// 			denyList[line[2:]] = true
-// 		}
-// 	}
-
-// 	if err := scanner.Err(); err != nil {
-// 		return nil, err
-// 	}
-
-// 	return denyList, nil
-// }
-
-// func convertCIDToBadBitsFormat(cidStr string) (string, error) {
-// 	// Format the line into an ipfs:// URI
-// 	// if strings.HasPrefix(cidStr, "/ipfs/") {
-// 	// 	cidStr = strings.TrimPrefix(cidStr, "/ipfs/")
-// 	// }
-// 	cidStr = strings.TrimPrefix(cidStr, "/ipfs/")
-
-// 	if !strings.HasPrefix(cidStr, "ipfs://") {
-// 		cidStr = "ipfs://" + cidStr
-// 	}
-
-// 	u, err := url.Parse(cidStr)
-// 	if err != nil {
-// 		return "", fmt.Errorf("unable to build IPFS URI: %w", err)
-// 	}
-
-// 	// Extract necessary parts of the URI.
-// 	c := u.Host
-// 	path := u.EscapedPath()
-
-// 	cc, err := cid.Parse(c)
-// 	if err != nil {
-// 		return "", fmt.Errorf("invalid CID: %w", err)
-// 	}
-
-// 	// Construct a v1 CID.
-// 	v1Cid := cid.NewCidV1(cc.Type(), cc.Hash())
-
-// 	// Append / or /<path>, if present.
-// 	var out string
-// 	if len(path) > 0 {
-// 		out = fmt.Sprintf("%s/%s", v1Cid, path)
-// 	} else {
-// 		out = fmt.Sprintf("%s/", v1Cid)
-// 	}
-
-// 	// Hash and base16 encode the result.
-// 	hasher := sha256.New()
-// 	hasher.Write([]byte(out))
-// 	encoded := hex.EncodeToString(hasher.Sum(nil))
-
-// 	return encoded, nil
-// }
-
-// func findLatestCSV(directory string) (string, error) {
-// 	var latestFile string
-// 	var latestTime time.Time
-
-// 	err := filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
-// 		if err != nil {
-// 			return err
-// 		}
-// 		if !info.IsDir() && strings.Contains(info.Name(), "_found-ipfs-phishing-links_ACTIVE_") && strings.HasSuffix(info.Name(), ".csv") {
-// 			if info.ModTime().After(latestTime) {
-// 				latestTime = info.ModTime()
-// 				latestFile = path
-// 			}
-// 		}
-// 		return nil
-// 	})
-
-// 	if err != nil {
-// 		return "", err
-// 	}
-
-// 	if latestFile == "" {
-// 		return "", fmt.Errorf("no matching CSV files found in directory: %s", directory)
-// 	}
-
-// 	return latestFile, nil
-// }
-
-// func checkBadBits() {
-// 	denyListFile := "src/badbits.deny"
-// 	if err := downloadBadBitsList(denyListURL, denyListFile); err != nil {
-// 		log.Fatalf("Failed to download bad bits denylist: %s", err)
-// 	}
-// 	log.Println("Bad bits denylist downloaded successfully.")
-
-// 	denyList, err := fetchAndParseDenyList(denyListFile)
-// 	if err != nil {
-// 		log.Fatalf("Failed to parse bad bits denylist: %s", err)
-// 	}
-
-// 	collectedDataDir := "./collected_data"
-// 	latestCSV, err := findLatestCSV(collectedDataDir)
-// 	if err != nil {
-// 		log.Fatalf("Failed to find the latest CSV: %s", err)
-// 	}
-// 	log.Printf("Latest CSV found: %s", latestCSV)
-
-// 	file, err := os.Open(latestCSV)
-// 	if err != nil {
-// 		log.Fatalf("Failed to open the latest CSV: %s", err)
-// 	}
-// 	defer file.Close()
-
-// 	date := time.Now().Format("20060102")
-// 	var outputPath string
-// 	counter := 1
+// func continuouslyRestartIPFSDaemon() {
 // 	for {
-// 		outputCSV := fmt.Sprintf("%s_badbits_check_%d.csv", date, counter)
-// 		outputPath = filepath.Join(collectedDataDir, outputCSV)
-// 		if _, err := os.Stat(outputPath); os.IsNotExist(err) {
-// 			break
-// 		}
-// 		counter++
-// 	}
-
-// 	outFile, err := os.Create(outputPath)
-// 	if err != nil {
-// 		log.Fatalf("Failed to create output CSV file: %s", err)
-// 	}
-// 	defer outFile.Close()
-// 	csvWriter := csv.NewWriter(outFile)
-// 	defer csvWriter.Flush()
-
-// 	if err := csvWriter.Write([]string{"CID", "BadBits"}); err != nil {
-// 		log.Fatalf("Failed to write CSV header: %s", err)
-// 	}
-
-// 	reader := csv.NewReader(file)
-// 	_, err = reader.Read() // skip header
-// 	if err != nil {
-// 		log.Fatalf("Failed to read CSV header: %s", err)
-// 	}
-
-// 	for {
-// 		record, err := reader.Read()
-// 		if err == io.EOF {
-// 			break
-// 		}
-// 		if err != nil {
-// 			log.Fatalf("Failed to read CSV record: %s", err)
-// 		}
-
-// 		cidStr := record[0]
-// 		hashedCID, err := convertCIDToBadBitsFormat(cidStr)
-// 		if err != nil {
-// 			log.Printf("Failed to convert CID to bad bits format: %s", err)
-// 			continue
-// 		}
-// 		badBits := "-"
-// 		if denyList[hashedCID] {
-// 			badBits = "+"
-// 		}
-// 		if err := csvWriter.Write([]string{cidStr, badBits}); err != nil {
-// 			log.Printf("Failed to write row to the CSV file: %s", err)
+// 		time.Sleep(1 * time.Minute)
+// 		log.Println("[I] Restarting IPFS daemon...")
+// 		if err := restartIPFSDaemon(); err != nil {
+// 			log.Printf("[I] Failed to restart IPFS daemon: %s", err)
+// 		} else {
+// 			log.Println("IPFS daemon restarted successfully.")
 // 		}
 // 	}
-
-// 	log.Printf("Bad bits check completed. Results saved to: %s", outputPath)
 // }
+
 
 func main() {
 	initLogger()
 
-	go continuouslyRestartIPFSDaemon()
+	// go continuouslyRestartIPFSDaemon()
+
+	apiTokenBytes, err := os.ReadFile("./src/api_token.txt")
+	if err != nil {
+		log.Fatalf("Failed to read API token: %s", err)
+	}
+	apiToken = strings.TrimSpace(string(apiTokenBytes))
 
 	var extract bool
 	flag.BoolVar(&extract, "e", false, "extract results live in CSV format")
+	var providerInfoFile string
+	flag.StringVar(&providerInfoFile, "providerInfoFile", "", "file name for provider info")
 	flag.Parse()
 
-	if !checkIPFSDaemon() {
-		log.Println("IPFS daemon is not running. Restarting...")
-		for {
-			if err := restartIPFSDaemon(); err != nil {
-				log.Printf("Failed to restart IPFS daemon: %s", err)
-				time.Sleep(5 * time.Second) // Wait before retrying
-			} else {
-				log.Println("IPFS daemon restarted successfully.")
-				break
-			}
-		}
-	}
+	// if !checkIPFSDaemon() {
+	// 	log.Println("IPFS daemon is not running. Restarting...")
+	// 	for {
+	// 		if err := restartIPFSDaemon(); err != nil {
+	// 			log.Printf("Failed to restart IPFS daemon: %s", err)
+	// 			time.Sleep(5 * time.Second) // Wait before retrying
+	// 		} else {
+	// 			log.Println("IPFS daemon restarted successfully.")
+	// 			break
+	// 		}
+	// 	}
+	// }
 
 	fileURL := "https://raw.githubusercontent.com/mitchellkrogza/Phishing.Database/master/ALL-phishing-links.txt"
 	filePath := "./phishing_db/ALL-phishing-links.txt"
@@ -861,17 +719,19 @@ func main() {
 	date := time.Now().Format("20060102")
 	counter := 1
 	// var filePathActiveIPFSLinks, 
-	var filePathActiveIPFSLinks, filePathActiveTxt string
+	var filePathActiveIPFSLinks, filePathActiveTxt, filePathProviderInfo string
 	for {
 		filePathActiveIPFSLinks = fmt.Sprintf("./collected_data/%s_found-ipfs-phishing-links_ACTIVE_%d.csv", date, counter)
 		filePathActiveTxt = fmt.Sprintf("./collected_data/%s_found-ipfs-phishing-links_ACTIVE_%d.txt", date, counter)
-		if _, err := os.Stat(filePathActiveIPFSLinks); os.IsNotExist(err) {
+		// filePathResponses = fmt.Sprintf("./collected_data/%s_responses_%d.csv", date, counter)
+		filePathProviderInfo = fmt.Sprintf("./collected_data/%s_provider_info_%d.csv", date, counter)
+		if _, err := os.Stat(filePathProviderInfo); os.IsNotExist(err) {
 			break
 		}
 		counter++	 
 	}
 
-	var err error
+	// var err error
 	ipfsGateways, err = readGatewaysFromFile("./src/ipfs_gateways.txt")
 	if err != nil {
 		log.Fatalf("Failed to read gateways from file: %s", err)
@@ -889,7 +749,19 @@ func main() {
 
 	log.Println("[!!] ipfs links found and saved successfully.")
 
+	// If providerInfoFile flag is provided, gather provider info for that specific file
+	if providerInfoFile != "" {
+		if err := gatherProviderInfo(providerInfoFile, filePathProviderInfo, apiToken); err != nil {
+			log.Fatalf("Failed to gather provider info: %s", err)
+		}
+		return
+	}
+	
 	checkIPFSLinks(filePathIPFSLinks, ipfsGateways, filePathActiveIPFSLinks, filePathActiveTxt, phishingCIDsFile)
+
+	if err := gatherProviderInfo(filePathActiveIPFSLinks, filePathProviderInfo, apiToken); err != nil {
+		log.Fatalf("Failed to gather provider info: %s", err)
+	}
 
 	checkBadBits()
 }

@@ -1,3 +1,4 @@
 log/*
 collected_data/*
 phishing_db/*
+src/api_token.txt

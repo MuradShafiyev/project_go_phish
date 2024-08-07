@@ -338,7 +338,9 @@ func processCIDs(linkChannel <-chan string, gateways []string, csvWriter, matchC
 	}
 }
 
-func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string, filePathActiveTxt string, phishingCIDsFilePath string) {
+// func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string, filePathActiveTxt string, phishingCIDsFilePath string) {
+func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string, filePathActiveTxt string) {
+
 	fileActiveTxt, err := os.Create(filePathActiveTxt)
 	if err != nil {
 		log.Fatalf("Failed to create text file: %s", err)
@@ -407,37 +409,37 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 
 	// linkChannel = make(chan string)
 
-	processPhishingCIDs := func() {
-		defer wg.Done()
+	// processPhishingCIDs := func() {
+	// 	defer wg.Done()
 
-		// Read CIDs from the 'phishing_cids.csv' file and send them to the channel
-		phishingCIDsFile, err := os.Open(phishingCIDsFilePath)
-		if err != nil {
-			log.Fatalf("Failed to open phishing CIDs file: %s", err)
-		}
-		defer phishingCIDsFile.Close()
-		phishingCIDsScanner := bufio.NewScanner(phishingCIDsFile)
-		linkChannel := make(chan string)
+	// 	// Read CIDs from the 'phishing_cids.csv' file and send them to the channel
+	// 	phishingCIDsFile, err := os.Open(phishingCIDsFilePath)
+	// 	if err != nil {
+	// 		log.Fatalf("Failed to open phishing CIDs file: %s", err)
+	// 	}
+	// 	defer phishingCIDsFile.Close()
+	// 	phishingCIDsScanner := bufio.NewScanner(phishingCIDsFile)
+	// 	linkChannel := make(chan string)
 
-		//Launching another goroutines
-		for i := 0; i < 3; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				processCIDs(linkChannel, gateways, csvWriter, matchContentWriter, responseWriter, fileActiveTxt, &resultsLock, processedCIDs, false)
-			}()
-		}
+	// 	//Launching another goroutines
+	// 	for i := 0; i < 3; i++ {
+	// 		wg.Add(1)
+	// 		go func() {
+	// 			defer wg.Done()
+	// 			processCIDs(linkChannel, gateways, csvWriter, matchContentWriter, responseWriter, fileActiveTxt, &resultsLock, processedCIDs, false)
+	// 		}()
+	// 	}
 
-		for phishingCIDsScanner.Scan() {
-			cid := phishingCIDsScanner.Text()
-			linkChannel <- cid
-		}
-		if err := phishingCIDsScanner.Err(); err != nil {
-			log.Printf("Error scanning phishing CIDs file: %s", err)
-		}
+	// 	for phishingCIDsScanner.Scan() {
+	// 		cid := phishingCIDsScanner.Text()
+	// 		linkChannel <- cid
+	// 	}
+	// 	if err := phishingCIDsScanner.Err(); err != nil {
+	// 		log.Printf("Error scanning phishing CIDs file: %s", err)
+	// 	}
 
-		close(linkChannel)
-	}
+	// 	close(linkChannel)
+	// }
 
 	processFoundIPFSLinks := func() {
 		defer wg.Done()
@@ -475,10 +477,10 @@ func checkIPFSLinks(filePathStr string, gateways []string, filePathActive string
 		close(linkChannel)
 	}
 	
-	wg.Add(1)
-	go processPhishingCIDs()
+	// wg.Add(1)
+	// go processPhishingCIDs()
 
-	wg.Wait()
+	// wg.Wait()
 	
 	wg.Add(1)
 	go processFoundIPFSLinks()
@@ -706,7 +708,7 @@ func main() {
 	fileURL := "https://raw.githubusercontent.com/mitchellkrogza/Phishing.Database/master/ALL-phishing-links.txt"
 	filePath := "./phishing_db/ALL-phishing-links.txt"
 	filePathIPFSLinks := "./phishing_db/found-ipfs-phishing-links.txt"
-	phishingCIDsFile := "./src/phishing_cids.csv"
+	// phishingCIDsFile := "./src/phishing_cids.csv"
 
 	//error handling for the collected_data directory
 	if _, err := os.Stat("./collected_data"); os.IsNotExist(err) {
@@ -757,7 +759,8 @@ func main() {
 		return
 	}
 	
-	checkIPFSLinks(filePathIPFSLinks, ipfsGateways, filePathActiveIPFSLinks, filePathActiveTxt, phishingCIDsFile)
+	// checkIPFSLinks(filePathIPFSLinks, ipfsGateways, filePathActiveIPFSLinks, filePathActiveTxt, phishingCIDsFile)
+	checkIPFSLinks(filePathIPFSLinks, ipfsGateways, filePathActiveIPFSLinks, filePathActiveTxt)
 
 	if err := gatherProviderInfo(filePathActiveIPFSLinks, filePathProviderInfo, apiToken); err != nil {
 		log.Fatalf("Failed to gather provider info: %s", err)

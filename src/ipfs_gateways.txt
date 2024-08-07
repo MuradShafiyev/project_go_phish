@@ -96,3 +96,7 @@ http://www.valkyriestaking.com/ipfs/
 http://yourlink.decentrafile.com/ipfs/
 http://209.94.90.1/ipfs/
 http://1479071244.nzingaadvisors.co.za/ipfs/
+http://abstractposs.infura-ipfs.io/ipfs/
+http://aloedelrio.omegasolucionesweb.com/ipfs/
+http://art-gymnastics.ru/redirect?url=https://dweb.link/ipfs/
+http://celestialnft.xyz/ipfs/

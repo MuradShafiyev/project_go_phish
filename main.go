@@ -759,6 +759,8 @@ func main() {
 		return
 	}
 	
+	download_content()
+
 	// checkIPFSLinks(filePathIPFSLinks, ipfsGateways, filePathActiveIPFSLinks, filePathActiveTxt, phishingCIDsFile)
 	checkIPFSLinks(filePathIPFSLinks, ipfsGateways, filePathActiveIPFSLinks, filePathActiveTxt)
 
@@ -766,5 +768,5 @@ func main() {
 		log.Fatalf("Failed to gather provider info: %s", err)
 	}
 
-	checkBadBits()
+	// checkBadBits()
 }

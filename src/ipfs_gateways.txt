@@ -94,3 +94,5 @@ http://www.clutch.im/ipfs/
 http://www.infura-ipfs.io/ipfs/
 http://www.valkyriestaking.com/ipfs/
 http://yourlink.decentrafile.com/ipfs/
+http://209.94.90.1/ipfs/
+http://1479071244.nzingaadvisors.co.za/ipfs/
